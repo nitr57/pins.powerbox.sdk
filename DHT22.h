@@ -25,6 +25,7 @@
 #ifndef DHT22_H
 #define DHT22_H
 
+#include <chrono>
 #include <string>
 
 namespace PowerBox
@@ -39,8 +40,21 @@ namespace PowerBox
             float getHumidity(void) const;
 
         private:
+            struct Reading
+            {
+                float value = 0.f;
+                bool valid = false;
+                std::chrono::steady_clock::time_point time;
+            };
+
             std::string read_(const std::string& path) const;
+            float hold_(const std::string& val, Reading& last) const;
+
             std::string path_;
+
+            // Last good values, reused for a grace period on transient read failures
+            mutable Reading temperature_;
+            mutable Reading humidity_;
     };
 } /* namespace PowerBox */
 

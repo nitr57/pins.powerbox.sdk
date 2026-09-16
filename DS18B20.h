@@ -26,11 +26,15 @@
 #define DS18B20_H
 
 #include "GPIOManager.h"
+#include <chrono>
 
 #define DEVICE_DISCONNECTED_C -127.f
 
 namespace PowerBox
 {
+    // How long the last good sensor value is reused when reads fail
+    constexpr std::chrono::seconds SENSOR_GRACE_PERIOD{60};
+
     class DS18B20
     {
         public:
@@ -54,6 +58,11 @@ namespace PowerBox
             uint8_t pin_;
 
             float current_temperature_;
+
+            // Last good value, reused for a grace period on transient read failures
+            float last_temperature_;
+            bool last_valid_;
+            std::chrono::steady_clock::time_point last_time_;
     };
 } /* namespace PowerBox */
 

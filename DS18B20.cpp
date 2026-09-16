@@ -38,6 +38,8 @@ namespace PowerBox
         this->gpio_ = &gpio;
         this->pin_ = UINT8_MAX;
         this->current_temperature_ = DEVICE_DISCONNECTED_C;
+        this->last_temperature_ = DEVICE_DISCONNECTED_C;
+        this->last_valid_ = false;
     }
 
     DS18B20::~DS18B20(void)
@@ -99,7 +101,17 @@ namespace PowerBox
             // Convert to Celsius
             this->current_temperature_ = (float)raw_temp * 0.0625f;
 
+            this->last_temperature_ = this->current_temperature_;
+            this->last_valid_ = true;
+            this->last_time_ = std::chrono::steady_clock::now();
+
             return this->current_temperature_;
+        }
+
+        // Bit-banged 1-Wire reads fail now and then, keep the last good value for a while
+        if(this->last_valid_ && std::chrono::steady_clock::now() - this->last_time_ < SENSOR_GRACE_PERIOD)
+        {
+            return this->last_temperature_;
         }
 
         return ERROR_TEMP;

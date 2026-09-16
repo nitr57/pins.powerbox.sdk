@@ -39,14 +39,34 @@ namespace PowerBox
 
     float DHT22::getTemperature(void) const
     {
-        std::string val = this->read_(this->path_ + "/in_temp_input");
-        return val.empty() ? DEVICE_DISCONNECTED_C : std::stof(val) * 0.001f;
+        return this->hold_(this->read_(this->path_ + "/in_temp_input"), this->temperature_);
     }
 
     float DHT22::getHumidity(void) const
     {
-        std::string val = this->read_(this->path_ + "/in_humidityrelative_input");
-        return val.empty() ? DEVICE_DISCONNECTED_C : std::stof(val) * 0.001f;
+        return this->hold_(this->read_(this->path_ + "/in_humidityrelative_input"), this->humidity_);
+    }
+
+    float DHT22::hold_(const std::string& val, Reading& last) const
+    {
+        auto now = std::chrono::steady_clock::now();
+
+        if(!val.empty())
+        {
+            last.value = std::stof(val) * 0.001f;
+            last.valid = true;
+            last.time = now;
+
+            return last.value;
+        }
+
+        // The kernel dht11 driver fails reads regularly, keep the last good value for a while
+        if(last.valid && now - last.time < SENSOR_GRACE_PERIOD)
+        {
+            return last.value;
+        }
+
+        return DEVICE_DISCONNECTED_C;
     }
 
     std::string DHT22::read_(const std::string& path) const
