@@ -22,7 +22,7 @@
  * SOFTWARE.
  * **************************************************************************** */
 
-#define SDK_VERSION "1.4.0"
+#define SDK_VERSION "1.5.0"
 
 #include "PowerBoxSDK.h"
 #include "PowerBoxLogging.h"
@@ -86,6 +86,19 @@ PBAPI PB_ERROR_TYPE PBScan(int *number, int *ids)
     PB_DEBUG("PBScan: Total devices found: %d", *number);
     return result;
 }
+
+#ifdef __unix__
+PBAPI PB_ERROR_TYPE PBScanPort(const char *port, int *id)
+{
+    PB_DEBUG("PBScanPort: Probing %s", port ? port : "(null)");
+    return ScanPowerBoxPort(port, id);
+}
+
+PBAPI PB_ERROR_TYPE PBGetPort(int id, char *port)
+{
+    return GetPowerBoxPort(id, port);
+}
+#endif
 
 PBAPI PB_ERROR_TYPE PBOpen(int id)
 {

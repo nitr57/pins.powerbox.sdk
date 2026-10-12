@@ -132,6 +132,7 @@ namespace PowerBox
             virtual int GetFirmwareVersion() { return this->firmwareVersion; }
             virtual std::string GetModelType() { return this->modelType; }
             virtual std::string GetUUID() { return this->uuid; }
+            std::string GetPortName() { return this->portName; }
 
             virtual PB_ERROR_TYPE Restart(void);
             virtual PB_ERROR_TYPE FactoryReset(void);
@@ -157,6 +158,9 @@ namespace PowerBox
 
         private:
             friend PB_ERROR_TYPE ScanPowerBox(int *number, int *ids);
+#ifdef __unix__
+            friend std::shared_ptr<PowerBoxDevice> ProbePowerBox(const std::string &portName);
+#endif
 
         private:
             void ParseHandshakeMessage(const char *buffer);
@@ -230,6 +234,11 @@ namespace PowerBox
     };
 
     PB_ERROR_TYPE ScanPowerBox(int *number, int *ids);
+#ifdef __unix__
+    std::shared_ptr<PowerBoxDevice> ProbePowerBox(const std::string &portName);
+    PB_ERROR_TYPE ScanPowerBoxPort(const char *port, int *id);
+    PB_ERROR_TYPE GetPowerBoxPort(int id, char *port);
+#endif
 
 } /* namespace PowerBox */
 

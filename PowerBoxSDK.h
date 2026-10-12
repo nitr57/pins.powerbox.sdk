@@ -41,6 +41,7 @@ extern "C"
 #define PB_NAME_LEN 32              /* Buffer length for name strings */
 #define PB_VERSION_LEN 32           /* Buffer length for version strings */
 #define PB_UUID_LEN 37              /* Buffer length for UUID */
+#define PB_PORT_LEN 256             /* Buffer length for port names */
 #define PB_IP_LEN 16                /* Buffer length for IP address */
 #define PB_SSID_LEN 32              /* Maximum SSID length */
 #define PB_HOSTNAME_LEN 32          /* Maximum hostname length */
@@ -267,6 +268,24 @@ extern "C"
 
     /* Device scanning and management */
     PBAPI PB_ERROR_TYPE PBScan(int *number, int *ids);
+#ifdef __unix__
+    /* Probes only the given port (as returned by PBGetPort, or a device node
+     * such as /dev/ttyUSB0) for a USB PowerBox instead of all CP210x ports, so
+     * no other device is touched. *id receives the device's id; a device
+     * already registered on that port keeps its id and is not probed again.
+     * Returns PB_ERROR_COMMUNICATION if no PowerBox answers there - fall back
+     * to PBScan then. */
+    PBAPI PB_ERROR_TYPE PBScanPort(const char *port, int *id);
+    /* port must have room for PB_PORT_LEN bytes. Receives a USB PowerBox's
+     * /dev/serial/by-path/... link, which stays the same across reconnects and
+     * reboots as long as it is plugged into the same USB socket, or its device
+     * node if there is no such link. Devices are registered under this link, so
+     * PBClose + PBOpen after a replug into the same socket reconnect even if
+     * the device comes back as a different /dev/ttyUSBn. Returns
+     * PB_ERROR_INVALID_STATE for devices without a serial port (PinsBox,
+     * StellaVita, ASIAir). */
+    PBAPI PB_ERROR_TYPE PBGetPort(int id, char *port);
+#endif
     PBAPI PB_ERROR_TYPE PBOpen(int id);
     PBAPI PB_ERROR_TYPE PBClose(int id);
     PBAPI PB_ERROR_TYPE PBGetSerial(int id, char *serial);

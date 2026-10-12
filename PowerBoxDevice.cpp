@@ -33,6 +33,7 @@
 #include <chrono>
 #include <atomic>
 #ifdef __unix__
+#include <climits>
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -1283,6 +1284,98 @@ namespace PowerBox
         return PB_SUCCESS;
     }
 
+#ifdef __unix__
+    /* The device node a port name currently points to. A device is registered
+     * under its /dev/serial/by-path/... link where it has one, which after a
+     * reconnect may point to a different node - compare ports only through
+     * this. Returns the name unchanged if it does not exist (unplugged). */
+    static std::string ResolvePort(const std::string &port)
+    {
+        char resolved[PATH_MAX];
+        return realpath(port.c_str(), resolved) ? std::string(resolved) : port;
+    }
+
+    /* True if the tty belongs to a CP210x USB-serial chip (10c4:ea60) */
+    static bool IsCp210x(struct udev_device *tty)
+    {
+        struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
+            tty, "usb", "usb_device");
+        if (!parent)
+        {
+            return false;
+        }
+
+        const char *vid = udev_device_get_sysattr_value(parent, "idVendor");
+        const char *pid = udev_device_get_sysattr_value(parent, "idProduct");
+        if (!vid || !pid)
+        {
+            return false;
+        }
+        PB_DEBUG("Found device with VID:%s PID:%s", vid, pid);
+        return strcmp(vid, "10c4") == 0 && strcmp(pid, "ea60") == 0;
+    }
+
+    /* The tty's /dev/serial/by-path/... link, which names the USB socket and
+     * so survives reconnects, or "" if it has none (or none that fits
+     * PB_PORT_LEN). udev lists the links sorted, so the choice is stable. Newer
+     * udev versions add a ...-usbv2-... link next to the legacy one; either
+     * works. */
+    static std::string ByPathLink(struct udev_device *tty)
+    {
+        struct udev_list_entry *entry;
+        udev_list_entry_foreach(entry, udev_device_get_devlinks_list_entry(tty))
+        {
+            const char *link = udev_list_entry_get_name(entry);
+            if (strncmp(link, "/dev/serial/by-path/", 20) == 0 && strlen(link) < PB_PORT_LEN)
+            {
+                return link;
+            }
+        }
+        return "";
+    }
+
+    /* Opens portName, performs the handshake and closes it again. Returns the
+     * (not yet opened) device if a PowerBox answered, nullptr otherwise. */
+    std::shared_ptr<PowerBoxDevice> ProbePowerBox(const std::string &portName)
+    {
+        PB_DEBUG("Trying to open device: %s", portName.c_str());
+
+        auto port = std::make_shared<SerialPort>();
+        if (!port->Open(portName.c_str()))
+        {
+            PB_DEBUG("Failed to open port %s", portName.c_str());
+            return nullptr;
+        }
+
+        PB_DEBUG("Port opened, flushing and sending command...");
+
+        auto tempDevice = std::make_shared<PowerBoxDevice>(port, portName);
+
+        // Send HS to wake up device
+        tempDevice->SendCommand(":HS#", 200);
+
+        // Start status listener thread
+        tempDevice->StartStatusListener();
+
+        // Perform handshake with retry mechanism
+        bool found = tempDevice->SendAndWaitForReplyWithRetry(":HS#", tempDevice->handshakeMutex, tempDevice->handshakeCV,
+                                                              tempDevice->handshakePending, "handshake");
+
+        /* Stop listener and close port - a valid device is reopened in PBOpen */
+        tempDevice->StopStatusListener();
+        port->Close();
+
+        if (!found)
+        {
+            PB_DEBUG("No response from device after handshake retries");
+            return nullptr;
+        }
+
+        PB_DEBUG("Valid device found!");
+        return tempDevice;
+    }
+#endif
+
     PB_ERROR_TYPE ScanPowerBox(int *number, int *ids)
     {
         if (!number || !ids)
@@ -1337,8 +1430,6 @@ namespace PowerBox
         struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate);
         struct udev_list_entry *entry;
 
-        char response[64];
-
         /* Iterate through all tty devices */
         udev_list_entry_foreach(entry, devices)
         {
@@ -1352,29 +1443,7 @@ namespace PowerBox
                 continue;
             }
 
-            /* Get the parent USB device */
-            struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
-                device, "usb", "usb_device");
-
-            if (!parent)
-            {
-                udev_device_unref(device);
-                continue;
-            }
-
-            /* Check VID and PID for CP210x (10c4:ea60) */
-            const char *vid = udev_device_get_sysattr_value(parent, "idVendor");
-            const char *pid = udev_device_get_sysattr_value(parent, "idProduct");
-
-            if (!vid || !pid)
-            {
-                udev_device_unref(device);
-                continue;
-            }
-
-            PB_DEBUG("Found device with VID:%s PID:%s", vid, pid);
-
-            if (strcmp(vid, "10c4") != 0 || strcmp(pid, "ea60") != 0)
+            if (!IsCp210x(device))
             {
                 udev_device_unref(device);
                 continue;
@@ -1388,49 +1457,16 @@ namespace PowerBox
                 continue;
             }
 
-            PB_DEBUG("Trying to open device: %s", deviceNode);
-
-            /* Try to open the port */
-            auto port = std::make_shared<SerialPort>();
-            if (port->Open(deviceNode))
+            /* Register the device under its by-path link if it has one, so
+             * PBOpen finds it again after a replug into the same socket */
+            std::string link = ByPathLink(device);
+            auto tempDevice = ProbePowerBox(link.empty() ? std::string(deviceNode) : link);
+            if (tempDevice)
             {
-                PB_DEBUG("Port opened, flushing and sending command...");
-
-                auto tempDevice = std::make_shared<PowerBoxDevice>(port, deviceNode);
-
-                // Send HS to wake up device
-                tempDevice->SendCommand(":HS#", 200);
-
-                // Start status listener thread
-                tempDevice->StartStatusListener();
-
-                // Perform handshake with retry mechanism
-                if(tempDevice->SendAndWaitForReplyWithRetry(":HS#", tempDevice->handshakeMutex, tempDevice->handshakeCV,
-                                                            tempDevice->handshakePending, "handshake"))
-                {
-                    PB_DEBUG("Valid device found!");
-
-                    /* Stop listener */
-                    tempDevice->StopStatusListener();
-
-                    /* Valid device found - close port, will be reopened in PBOpen */
-                    port->Close();
-                    int id = count;
-                    g_devices[id] = tempDevice;
-                    ids[count] = id;
-                    count++;
-                }
-                else
-                {
-                    PB_DEBUG("No response from device after handshake retries");
-                    /* Not a valid device, stop listener and close port */
-                    tempDevice->StopStatusListener();
-                    port->Close();
-                }
-            }
-            else
-            {
-                PB_DEBUG("Failed to open port %s", deviceNode);
+                int id = count;
+                g_devices[id] = tempDevice;
+                ids[count] = id;
+                count++;
             }
 
             udev_device_unref(device);
@@ -1579,4 +1615,130 @@ namespace PowerBox
         *number += count;
         return PB_SUCCESS;
     }
+
+#ifdef __unix__
+    PB_ERROR_TYPE ScanPowerBoxPort(const char *port, int *id)
+    {
+        if (!port || !id)
+        {
+            return PB_ERROR_NULL_POINTER;
+        }
+
+        std::lock_guard<std::mutex> lock(g_globalMutex);
+
+        /* Compare device nodes: the registered device may have been found on
+         * a by-path link or by device node */
+        char resolved[PATH_MAX];
+        if (!realpath(port, resolved))
+        {
+            PB_DEBUG("PBScanPort: %s does not exist", port);
+            return PB_ERROR_COMMUNICATION;
+        }
+
+        for (const auto &pair : g_devices)
+        {
+            auto powerBox = std::dynamic_pointer_cast<PowerBoxDevice>(pair.second);
+            if (powerBox && ResolvePort(powerBox->GetPortName()) == resolved)
+            {
+                *id = pair.first;
+                return PB_SUCCESS;
+            }
+        }
+
+        /* A by-path link names a USB socket, not a device: if something else
+         * is plugged in there now, leave it alone */
+        struct udev *udev = udev_new();
+        if (!udev)
+        {
+            return PB_ERROR_COMMUNICATION;
+        }
+        const char *name = strrchr(resolved, '/');
+        struct udev_device *tty = udev_device_new_from_subsystem_sysname(udev, "tty", name ? name + 1 : resolved);
+        bool cp210x = tty && IsCp210x(tty);
+        if (tty)
+        {
+            udev_device_unref(tty);
+        }
+        udev_unref(udev);
+        if (!cp210x)
+        {
+            PB_DEBUG("PBScanPort: %s is not a CP210x port", resolved);
+            return PB_ERROR_COMMUNICATION;
+        }
+
+        /* Keep the name as given: a by-path link then follows the device to
+         * whatever node it gets after a reconnect in the same socket */
+        auto device = ProbePowerBox(port);
+        if (!device)
+        {
+            PB_DEBUG("PBScanPort: No PowerBox on %s", resolved);
+            return PB_ERROR_COMMUNICATION;
+        }
+
+        /* Smallest free id: never replace a device another scan registered */
+        int newId = 0;
+        while (g_devices.count(newId) > 0)
+            newId++;
+        g_devices[newId] = device;
+        *id = newId;
+
+        PB_INFO("Found PowerBox on %s (id=%d)", port, newId);
+        return PB_SUCCESS;
+    }
+
+    PB_ERROR_TYPE GetPowerBoxPort(int id, char *port)
+    {
+        if (!port)
+        {
+            return PB_ERROR_NULL_POINTER;
+        }
+
+        std::string result;
+        {
+            std::lock_guard<std::mutex> lock(g_globalMutex);
+            auto it = g_devices.find(id);
+            if (it == g_devices.end())
+            {
+                return PB_ERROR_INVALID_ID;
+            }
+            auto powerBox = std::dynamic_pointer_cast<PowerBoxDevice>(it->second);
+            if (!powerBox)
+            {
+                return PB_ERROR_INVALID_STATE;
+            }
+            result = powerBox->GetPortName();
+        }
+
+        /* Found on a by-path link already: that is the name to keep. Otherwise
+         * (registered by device node, e.g. PBScanPort("/dev/ttyUSB0")) look the
+         * link up. */
+        std::string node = ResolvePort(result);
+        const char *name = strrchr(node.c_str(), '/');
+        struct udev *udev = udev_new();
+        if (result.rfind("/dev/serial/by-path/", 0) != 0 && udev && name)
+        {
+            struct udev_device *tty = udev_device_new_from_subsystem_sysname(udev, "tty", name + 1);
+            if (tty)
+            {
+                std::string link = ByPathLink(tty);
+                if (!link.empty())
+                {
+                    result = link;
+                }
+                udev_device_unref(tty);
+            }
+        }
+        if (udev)
+        {
+            udev_unref(udev);
+        }
+
+        if (result.size() >= PB_PORT_LEN)
+        {
+            return PB_ERROR_INVALID_STATE;
+        }
+        memcpy(port, result.c_str(), result.size() + 1);
+        return PB_SUCCESS;
+    }
+#endif
 } /* namespace PowerBox */
