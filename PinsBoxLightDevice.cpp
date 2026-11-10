@@ -163,9 +163,12 @@ namespace PowerBox
         for (int i = 0; i < PINSBOX_NUM_POWER_PORTS; ++i)
             this->powerReadOnly[i] = false;
 
-        // All USB ports are readonly
+        // All USB ports are readonly and always on
         for (int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i)
+        {
             this->usbReadOnly[i] = true;
+            this->usbState[i] = 1;
+        }
     }
 
     PinsBoxLightDevice::~PinsBoxLightDevice(void)
@@ -445,6 +448,8 @@ namespace PowerBox
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
+            // Track the driver state, it changes on its own on an over current shutdown
+            this->powerState[i] = this->powerReadOnly[i] ? 1 : this->pwr_[i]->getState();
         }
     }
 

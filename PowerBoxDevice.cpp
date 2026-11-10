@@ -397,6 +397,11 @@ namespace PowerBox
                     /* Wifi status */
                     this->ParseWiFiInfoMessage(buffer);
                 }
+                else if (strstr(buffer, "OC:") == buffer)
+                {
+                    /* Over current shutdown done by the firmware */
+                    this->ParseOvercurrentMessage(buffer);
+                }
                 else if (strstr(buffer, "WSURV:") == buffer)
                 {
                     /* Wifi survey */
@@ -406,6 +411,63 @@ namespace PowerBox
         }
 
         PB_DEBUG("StatusListener: exiting");
+    }
+
+    /* The firmware switches a port off on over current and reports it as
+     * OC:<type>:<port>#, with the port types from the firmware's def.h. The
+     * cached state is only refreshed on request otherwise, so update it here */
+    void PowerBoxDevice::ParseOvercurrentMessage(const char *buffer)
+    {
+        static const int OC_PORT_PWR = 0x01;
+        static const int OC_PORT_USB = 0x02;
+        static const int OC_PORT_DEW = 0x04;
+        static const int OC_PORT_ADJ = 0x08;
+
+        int type, port;
+        if (sscanf(buffer, "OC:%d:%d#", &type, &port) != 2 || port < 0)
+        {
+            return;
+        }
+
+        PB_INFO("Over current shutdown reported (type %d, port %d)", type, port);
+
+        switch (type)
+        {
+            case OC_PORT_PWR:
+                if (port < this->GetNumPowerPorts())
+                {
+                    this->powerState[port] = 0;
+                    this->powerOvercurrent[port] = 1;
+                }
+                break;
+            case OC_PORT_USB:
+                if (port < this->GetNumUSBPorts())
+                {
+                    this->usbState[port] = 0;
+                    this->usbOvercurrent[port] = 1;
+                }
+                break;
+            case OC_PORT_DEW:
+                if (port < this->GetNumDewPorts())
+                {
+                    this->dewState[port] = 0;
+                    this->dewOvercurrent[port] = 1;
+                }
+                break;
+            case OC_PORT_ADJ:
+                /* ADJ port 0 is the buck converter, port 1 the PWM port */
+                if (port == 0)
+                {
+                    this->buckState = 0;
+                    this->buckOvercurrent = 1;
+                }
+                else if (port == 1)
+                {
+                    this->pwmState = 0;
+                    this->pwmOvercurrent = 1;
+                }
+                break;
+        }
     }
 
     void PowerBoxDevice::ParseHandshakeMessage(const char *buffer)

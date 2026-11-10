@@ -165,6 +165,7 @@ namespace PowerBox
         private:
             void ParseHandshakeMessage(const char *buffer);
             void ParseUptimeMessage(const char *buffer);
+            void ParseOvercurrentMessage(const char *buffer);
             void ParseEnvironmentMessage(const char *buffer);
             void ParseEnvModelMessage(const char *buffer);
             void ParseUpdateRateMessage(const char *buffer);

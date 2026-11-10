@@ -127,6 +127,7 @@ extern "C"
         float current[PB_MAX_POWER_PORTS];          /* Current draw [A] */
         int overcurrent[PB_MAX_POWER_PORTS];        /* Overcurrent flag */
         int readOnly[PB_MAX_POWER_PORTS];           /* Indicates if the port can be modified */
+        int state[PB_MAX_POWER_PORTS];              /* Port state (ON/OFF), also reflects over current shutdowns */
     } PB_POWER_PORT_STATUS;
 
     typedef struct _PB_USB_PORT_STATUS
@@ -136,6 +137,7 @@ extern "C"
         float voltage[PB_MAX_USB_PORTS];            /* Output voltage [V] */
         int overcurrent[PB_MAX_USB_PORTS];          /* Overcurrent flag */
         int readOnly[PB_MAX_POWER_PORTS];           /* Indicates if the port can be modified */
+        int state[PB_MAX_USB_PORTS];                /* Port state (ON/OFF), also reflects over current shutdowns */
     } PB_USB_PORT_STATUS;
 
     typedef struct _PB_DEW_PORT_STATUS
@@ -158,6 +160,7 @@ extern "C"
         float vset;                                  /* Set voltage [V] */
         float vmin;                                  /* Minimum voltage [V] */
         float vmax;                                  /* Maximum voltage [V] */
+        int state;                                   /* Port state (ON/OFF), also reflects over current shutdowns */
     } PB_BUCK_PORT_STATUS;
 
     typedef struct _PB_PWM_PORT_STATUS
@@ -167,6 +170,7 @@ extern "C"
         float current;                               /* Current draw [A] */
         int overcurrent;                             /* Overcurrent flag */
         int pwm;                                     /* PWM value [%] */
+        int state;                                   /* Port state (ON/OFF), also reflects over current shutdowns */
     } PB_PWM_PORT_STATUS;
 
     typedef struct _PB_WIFI_STATUS

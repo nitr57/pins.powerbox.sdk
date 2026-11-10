@@ -144,6 +144,7 @@ namespace PowerBox
 
         // Initialize PWR ports
         this->pwr_[0]->begin(1200, PWRDEN_PINS[0], 255, DSEL_PIN, 0);
+        this->powerState[0] = 1;  // port 0 has no switch and is always on
         this->pwr_[1]->begin(1200, PWRDEN_PINS[0], PWR_PINS[0], DSEL_PIN, 1, this->powerBootstrap[1]);
         this->pwr_[2]->begin(1200, PWRDEN_PINS[1], PWR_PINS[1], DSEL_PIN, 0, this->powerBootstrap[2]);
         this->pwr_[3]->begin(1200, PWRDEN_PINS[1], PWR_PINS[2], DSEL_PIN, 1, this->powerBootstrap[3]);
@@ -747,6 +748,8 @@ namespace PowerBox
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
+            // Track the driver state, it changes on its own on an over current shutdown
+            this->powerState[i] = i == 0 ? 1 : this->pwr_[i]->getState();
         }
         
         for(int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i)
@@ -758,6 +761,7 @@ namespace PowerBox
             this->usbCurrent[i] = this->usb_[i]->getCurrent_mA() * 0.001f;
             this->usbVoltage[i] = this->usb_[i]->getVoltage_mV() * 0.001f;
             this->usbOvercurrent[i] = this->usb_[i]->getOverCurrent() ? 1 : 0;
+            this->usbState[i] = this->usb_[i]->getState();
         }
 
         // Dew ports
@@ -784,6 +788,7 @@ namespace PowerBox
             this->buckCurrent = this->buck_->getCurrent_mA() * 0.001f;
             this->buckOvercurrent = this->buck_->getOverCurrent() ? 1 : 0;
             this->buckOvervoltage = this->buck_->getOverVoltage() ? 1 : 0;
+            this->buckState = this->buck_->getState();
         }
 
         {
@@ -791,6 +796,7 @@ namespace PowerBox
             this->pwm_->measureCurrent();
             this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
             this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+            this->pwmState = this->pwm_->getState();
         }
     }
 
@@ -959,7 +965,7 @@ namespace PowerBox
         {
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->buck_->setState(state, target);
-            this->buckState = state;
+            this->buckState = this->buck_->getState();
             this->buckVset = target;
         }
         SaveSettings();
@@ -986,7 +992,7 @@ namespace PowerBox
     {
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
-        this->pwmState = state;
+        this->pwmState = this->pwm_->getState();
         this->pwmPWM = power;
         return true;
     }

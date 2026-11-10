@@ -23,12 +23,16 @@
  * **************************************************************************** */
 
 #include "PowerBoxLogging.h"
+#include <cstring>
 #include "Device.h"
 
 namespace PowerBox
 {
     PB_ERROR_TYPE Device::GetPowerPortStatus(PB_POWER_PORT_STATUS *status) const
     {
+        // Ports beyond numPorts are not filled below, do not hand out garbage for them
+        memset(status, 0, sizeof(*status));
+
         status->numPorts = this->GetNumPowerPorts();
 
         for (int i = 0; i < this->GetNumPowerPorts(); ++i)
@@ -36,6 +40,7 @@ namespace PowerBox
             status->current[i] = this->powerCurrent[i];
             status->overcurrent[i] = this->powerOvercurrent[i];
             status->readOnly[i] = this->powerReadOnly[i];
+            status->state[i] = this->powerState[i];
         }
 
         return PB_SUCCESS;
@@ -43,6 +48,9 @@ namespace PowerBox
 
     PB_ERROR_TYPE Device::GetUSBPortStatus(PB_USB_PORT_STATUS *status) const
     {
+        // Ports beyond numPorts are not filled below, do not hand out garbage for them
+        memset(status, 0, sizeof(*status));
+
         status->numPorts = this->GetNumUSBPorts();
 
         for (int i = 0; i < this->GetNumUSBPorts(); ++i)
@@ -51,6 +59,7 @@ namespace PowerBox
             status->voltage[i] = this->usbVoltage[i];
             status->overcurrent[i] = this->usbOvercurrent[i];
             status->readOnly[i] = this->usbReadOnly[i];
+            status->state[i] = this->usbState[i];
         }
 
         return PB_SUCCESS;
@@ -58,6 +67,9 @@ namespace PowerBox
 
     PB_ERROR_TYPE Device::GetDewPortStatus(PB_DEW_PORT_STATUS *status) const
     {
+        // Ports beyond numPorts are not filled below, do not hand out garbage for them
+        memset(status, 0, sizeof(*status));
+
         status->numPorts = this->GetNumDewPorts();
         status->pwmResolution = this->dewPwmResolution;
 
@@ -75,6 +87,9 @@ namespace PowerBox
 
     PB_ERROR_TYPE Device::GetBuckPortStatus(PB_BUCK_PORT_STATUS *status) const
     {
+        // Ports beyond numPorts are not filled below, do not hand out garbage for them
+        memset(status, 0, sizeof(*status));
+
         status->numPorts = this->GetNumBuckPorts();
         status->current = this->buckCurrent;
         status->voltage = this->buckVoltage;
@@ -82,17 +97,22 @@ namespace PowerBox
         status->vset = this->buckVset;
         status->vmin = this->buckVmin;
         status->vmax = this->buckVmax;
+        status->state = this->buckState;
 
         return PB_SUCCESS;
     }
 
     PB_ERROR_TYPE Device::GetPWMPortStatus(PB_PWM_PORT_STATUS *status) const
     {
+        // Ports beyond numPorts are not filled below, do not hand out garbage for them
+        memset(status, 0, sizeof(*status));
+
         status->numPorts = this->GetNumPWMPorts();
         status->pwmResolution = this->pwmPwmResolution;
         status->current = this->pwmCurrent;
         status->overcurrent = this->pwmOvercurrent;
         status->pwm = this->pwmPWM;
+        status->state = this->pwmState;
 
         return PB_SUCCESS;
     }

@@ -180,10 +180,11 @@ namespace PowerBox
             this->powerReadOnly[i] = false;
         }
 
-        // USB ports are read-only / non-controllable
+        // USB ports are read-only / non-controllable and always on
         for(int i = 0; i < PINSBOXMINI_NUM_USB_PORTS; ++i)
         {
             this->usbReadOnly[i] = true;
+            this->usbState[i] = 1;
         }
 
         // Dew ports (BTS7080 + DS18B20 probe). Shared DEN (GPIO4), DSEL selects port.
@@ -681,6 +682,8 @@ namespace PowerBox
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
+            // Track the driver state, it changes on its own on an over current shutdown
+            this->powerState[i] = this->pwr_[i]->getState();
         }
 
         // Dew ports
@@ -701,6 +704,7 @@ namespace PowerBox
             this->pwm_->measureCurrent();
             this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
             this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+            this->pwmState = this->pwm_->getState();
         }
 
         // Correct the "sel 1" ports for the mis-wired BTS7006 sense bleeding onto
@@ -862,7 +866,7 @@ namespace PowerBox
     {
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
-        this->pwmState = state;
+        this->pwmState = this->pwm_->getState();
         this->pwmPWM = power;
         return true;
     }
