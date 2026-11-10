@@ -48,7 +48,7 @@ namespace PowerBox
             void disable(void) { this->bts_->disable(); }
             void toggle(void) { this->bts_->toggle(); }
             void setState(uint8_t state, uint8_t dc);
-            void setAutoMode(uint8_t mode) { this->auto_mode_ = mode != 0; }
+            void setAutoMode(uint8_t mode);
 
             uint16_t getCurrent_mA(void) const { return this->bts_->getCurrent_mA(); }
             uint8_t getState(void) const { return this->bts_->getState(); }

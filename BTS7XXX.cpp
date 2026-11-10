@@ -303,6 +303,14 @@ namespace PowerBox
         // Read sense output from adc
         uint16_t adc = this->mcp_->analogReadAverage(this->mcp_ch_, this->mcp_n_, this->mcp_delay_);
 
+        // A sense only instance (no power pin, e.g. the supply input) has nothing to
+        // switch off: evaluate the over current flag per measurement instead of
+        // latching it, otherwise one high reading zeroes the current until restart
+        if(this->pwr_pin_ == UINT8_MAX)
+        {
+            this->over_current_ = false;
+        }
+
         // Check for over current. If the flag is already set the port is still on
         // because the shutdown failed; measureCurrent retried it this cycle already
         if(adc >= this->iis_fault_ * kILIS)

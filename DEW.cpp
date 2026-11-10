@@ -81,8 +81,11 @@ namespace PowerBox
     template <typename MCP>
     void DewPortT<MCP>::update(float dewPoint, float threshold)
     {
-        // Update heater power, if auto mode is enabled and probe is available
-        if(this->auto_mode_)
+        // Update heater power, if auto mode is enabled and probe is available.
+        // After an over current the port stays off until the user intervenes
+        // (auto mode off and on again, or switching the port manually), otherwise
+        // auto mode would switch a faulty heater back on every second
+        if(this->auto_mode_ && !this->bts_->getOverCurrent())
         {
             float temperature = this->probe_->getTemperature();
 
@@ -118,6 +121,18 @@ namespace PowerBox
         // Measure properties
         this->probe_->measureTemperature();
         this->bts_->measureCurrent();
+    }
+
+    template <typename MCP>
+    void DewPortT<MCP>::setAutoMode(uint8_t mode)
+    {
+        // Switching auto mode on is a user action that releases an over current lockout
+        if(mode != 0 && !this->auto_mode_)
+        {
+            this->bts_->resetOverCurrent();
+        }
+
+        this->auto_mode_ = mode != 0;
     }
 
     template <typename MCP>
