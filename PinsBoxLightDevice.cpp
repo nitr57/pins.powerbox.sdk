@@ -479,9 +479,11 @@ namespace PowerBox
 
         std::lock_guard<std::mutex> lock(this->hwMutex_);
 
-        this->pwr_[i]->setState(state);
-        this->powerState[i] = state;
-        return true;
+        // Report the state the port is actually in, a failed switch must not
+        // show up as success in the API
+        bool ok = this->pwr_[i]->setState(state);
+        this->powerState[i] = this->pwr_[i]->getState();
+        return ok;
     }
 
     bool PinsBoxLightDevice::SetPowerBootState(int i, int state)

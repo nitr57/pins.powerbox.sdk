@@ -133,11 +133,28 @@ namespace PowerBox
     }
 
     template <typename MCP, uint16_t kILIS>
-    void BTS7XXX_<MCP, kILIS>::enable(void)
+    bool BTS7XXX_<MCP, kILIS>::enable(void)
     {
         if(this->init_ == true && this->enabled_ == false && this->pwr_pin_ != UINT8_MAX)
         {
-            this->gpio_->digitalWrite(this->pwr_pin_, HIGH);
+            // Only track the port as enabled if the pin was actually switched
+            if(!this->gpio_->digitalWrite(this->pwr_pin_, HIGH))
+            {
+                // The write may have reached the pin although it reported an error;
+                // drive it low again so the port cannot end up on but unmonitored
+                this->gpio_->digitalWrite(this->pwr_pin_, LOW);
+
+                if(this->switch_error_.fail())
+                {
+                    PB_ERROR("BTS7XXX: failed to enable port (pin %u, %u failures)", this->pwr_pin_, this->switch_error_.failures());
+                }
+                return false;
+            }
+
+            if(this->switch_error_.succeed())
+            {
+                PB_INFO("BTS7XXX: port (pin %u) switches again", this->pwr_pin_);
+            }
 
             // Wait 1ms
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -148,14 +165,30 @@ namespace PowerBox
             // Reset over current state
             this->over_current_ = false;
         }
+
+        return true;
     }
 
     template <typename MCP, uint16_t kILIS>
-    void BTS7XXX_<MCP, kILIS>::disable(void)
+    bool BTS7XXX_<MCP, kILIS>::disable(void)
     {
         if(this->init_ == true && this->enabled_ == true && this->pwr_pin_ != UINT8_MAX)
         {
-            this->gpio_->digitalWrite(this->pwr_pin_, LOW);
+            // If the pin could not be switched the port is still on: keep it marked
+            // enabled, so it stays monitored and the next over current check retries
+            if(!this->gpio_->digitalWrite(this->pwr_pin_, LOW))
+            {
+                if(this->switch_error_.fail())
+                {
+                    PB_ERROR("BTS7XXX: failed to disable port (pin %u, %u failures)", this->pwr_pin_, this->switch_error_.failures());
+                }
+                return false;
+            }
+
+            if(this->switch_error_.succeed())
+            {
+                PB_INFO("BTS7XXX: port (pin %u) switches again", this->pwr_pin_);
+            }
 
             // Set port disabled
             this->enabled_ = false;
@@ -163,33 +196,37 @@ namespace PowerBox
 
         // Reset over current state
         this->over_current_ = false;
+
+        return true;
     }
 
     template <typename MCP, uint16_t kILIS>
-    void BTS7XXX_<MCP, kILIS>::toggle(void)
+    bool BTS7XXX_<MCP, kILIS>::toggle(void)
     {
         if(this->init_ == true)
         {
             if(this->enabled_ == true)
             {
-                this->disable();
+                return this->disable();
             }
             else
             {
-                this->enable();
+                return this->enable();
             }
         }
+
+        return false;
     }
 
     template <typename MCP, uint16_t kILIS>
-    void BTS7XXX_<MCP, kILIS>::setState(uint8_t state)
+    bool BTS7XXX_<MCP, kILIS>::setState(uint8_t state)
     {
         if(this->enabled_ == state)
         {
-            return;
+            return true;
         }
 
-        this->toggle();
+        return this->toggle();
     }
 
     template <typename MCP, uint16_t kILIS>
@@ -197,6 +234,18 @@ namespace PowerBox
     {
         if(this->init_ == true)
         {
+            // A previous over current shutdown failed and the port is still on:
+            // retry it on every measurement until it succeeds
+            if(this->over_current_ == true && this->enabled_ == true && this->pwr_pin_ != UINT8_MAX)
+            {
+                if(this->disable())
+                {
+                    this->over_current_ = true;
+                    this->current_mA_ = 0;
+                    return;
+                }
+            }
+
             if(this->enabled_ == true || this->pwr_pin_ == UINT8_MAX)
             {
                 // Get current
@@ -254,17 +303,24 @@ namespace PowerBox
         // Read sense output from adc
         uint16_t adc = this->mcp_->analogReadAverage(this->mcp_ch_, this->mcp_n_, this->mcp_delay_);
 
-        // Check for over current
+        // Check for over current. If the flag is already set the port is still on
+        // because the shutdown failed; measureCurrent retried it this cycle already
         if(adc >= this->iis_fault_ * kILIS)
         {
             // Serious fault event triggered, disable port and set fault flag
-            this->disable();
+            if(this->over_current_ == false)
+            {
+                this->disable();
+            }
             this->over_current_ = true;
         }
         else if(adc > this->max_current_)
         {
             // Weak current violation
-            this->disable();
+            if(this->over_current_ == false)
+            {
+                this->disable();
+            }
             this->over_current_ = true;
         }
 
@@ -274,7 +330,9 @@ namespace PowerBox
         // Put selection pin back to low
         this->gpio_->digitalWrite(this->sel_pin_, LOW);
 
-        return (this->over_current_ == true ? 0 : adc);
+        // Report 0 for a port that was shut off, but the real current while a
+        // failed shutdown keeps the port on
+        return (this->over_current_ == true && this->enabled_ == false ? 0 : adc);
     }
 
     template <typename MCP, uint16_t kILIS>

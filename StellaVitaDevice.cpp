@@ -280,7 +280,8 @@ namespace PowerBox
         if (i < 0 || i >= STELLAVITA_NUM_POWER_PORTS)
             return false;
 
-        this->gpio_->digitalWrite(STELLAVITA_PWR_PINS[i], state ? 1 : 0);
+        if (!this->gpio_->digitalWrite(STELLAVITA_PWR_PINS[i], state ? 1 : 0))
+            return false;
         this->powerState[i] = state;
         return true;
     }
@@ -311,7 +312,8 @@ namespace PowerBox
             return false;
 
         uint8_t pin = STELLAVITA_USB_PINS[i];
-        this->gpio_->digitalWrite(pin, state ? 1 : 0);
+        if (!this->gpio_->digitalWrite(pin, state ? 1 : 0))
+            return false;
         /* Sync all ports that share the same GPIO */
         for (int j = 0; j < STELLAVITA_NUM_USB_PORTS; ++j)
             if (STELLAVITA_USB_PINS[j] == pin)

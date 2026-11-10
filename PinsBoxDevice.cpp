@@ -844,9 +844,11 @@ namespace PowerBox
             return false;
         }
 
-        this->pwr_[i]->setState(state);
-        this->powerState[i] = state;
-        return true;
+        // Report the state the port is actually in, a failed switch must not
+        // show up as success in the API
+        bool ok = this->pwr_[i]->setState(state);
+        this->powerState[i] = this->pwr_[i]->getState();
+        return ok;
     }
 
     bool PinsBoxDevice::SetPowerBootState(int i, int state)
@@ -875,17 +877,11 @@ namespace PowerBox
             return false;
         }
 
-        if(state)
-        {
-            this->usb_[i]->enable();
-        }
-        else
-        {
-            this->usb_[i]->disable();
-        }
-
-        this->usbState[i] = state;
-        return true;
+        // Report the state the port is actually in, a failed switch must not
+        // show up as success in the API
+        bool ok = state ? this->usb_[i]->enable() : this->usb_[i]->disable();
+        this->usbState[i] = this->usb_[i]->getState();
+        return ok;
     }
 
     bool PinsBoxDevice::SetUSBBootState(int i, int state)

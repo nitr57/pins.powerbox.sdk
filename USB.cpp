@@ -24,6 +24,7 @@
 
 #include "USB.h"
 #include "INA219.h"
+#include "PowerBoxLogging.h"
 
 namespace PowerBox
 {
@@ -87,29 +88,64 @@ namespace PowerBox
         }
     }
 
-    void USB::enable(void)
+    bool USB::enable(void)
     {
         if(this->enabled_ == false)
         {
-            this->gpio_->digitalWrite(this->pin_, 1);
+            // Only track the port as enabled if the pin was actually switched
+            if(!this->gpio_->digitalWrite(this->pin_, 1))
+            {
+                // The write may have reached the pin although it reported an error;
+                // drive it low again so the port cannot end up on but unmonitored
+                this->gpio_->digitalWrite(this->pin_, 0);
+
+                if(this->switch_error_.fail())
+                {
+                    PB_ERROR("USB: failed to enable port (pin %u, %u failures)", this->pin_, this->switch_error_.failures());
+                }
+                return false;
+            }
+
+            if(this->switch_error_.succeed())
+            {
+                PB_INFO("USB: port (pin %u) switches again", this->pin_);
+            }
         }
 
         // Reset over current state
         this->over_current_ = false;
         this->enabled_ = true;
+
+        return true;
     }
 
-    void USB::disable(void)
+    bool USB::disable(void)
     {
         if(this->enabled_ == true)
         {
-            this->gpio_->digitalWrite(this->pin_, 0);
+            // If the pin could not be switched the port is still on: keep it marked
+            // enabled, so it stays monitored and the next over current check retries
+            if(!this->gpio_->digitalWrite(this->pin_, 0))
+            {
+                if(this->switch_error_.fail())
+                {
+                    PB_ERROR("USB: failed to disable port (pin %u, %u failures)", this->pin_, this->switch_error_.failures());
+                }
+                return false;
+            }
+
+            if(this->switch_error_.succeed())
+            {
+                PB_INFO("USB: port (pin %u) switches again", this->pin_);
+            }
         }
 
         this->enabled_ = false;
 
         // Reset over current state
         this->over_current_ = false;
+
+        return true;
     }
 
     void USB::toggle(void)
@@ -131,14 +167,33 @@ namespace PowerBox
 
     void USB::measureCurrent(void)
     {
+        // A previous over current shutdown failed and the port is still on:
+        // retry it on every measurement until it succeeds
+        if(this->over_current_ == true && this->enabled_ == true)
+        {
+            if(this->disable())
+            {
+                this->over_current_ = true;
+                this->current_mA_ = 0;
+                return;
+            }
+        }
+
         uint16_t current = (this->enabled_ == true ? this->ina_->getCurrent_mA() : 0);
 
         if(current > this->max_current_ * 1e3)
         {
-            // Turn off the port
-            this->disable();
+            // Turn off the port. If the flag is already set the port is still on
+            // because the shutdown failed; it was retried above this cycle already
+            if(this->over_current_ == false)
+            {
+                this->disable();
+            }
             this->over_current_ = true;
-            this->current_mA_ = 0;
+
+            // Report 0 for a port that was shut off, but the real current while a
+            // failed shutdown keeps the port on
+            this->current_mA_ = this->enabled_ == true ? current : 0;
         }
         else
         {

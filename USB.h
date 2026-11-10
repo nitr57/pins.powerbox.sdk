@@ -26,6 +26,7 @@
 #define USB_H
 
 #include "GPIOManager.h"
+#include "ErrorThrottle.h"
 #include <stdint.h>
 
 namespace PowerBox
@@ -40,8 +41,8 @@ namespace PowerBox
 
             uint8_t begin(uint8_t pin, uint8_t address, float maxCurrent, uint8_t state = false);
 
-            void enable(void);
-            void disable(void);
+            bool enable(void);
+            bool disable(void);
             void toggle(void);
 
             void measureVoltage(void);
@@ -70,6 +71,9 @@ namespace PowerBox
 
             // Pin to enable / disable USB port
             uint8_t pin_;
+
+            // Rate limits the log for a pin that keeps failing to switch
+            ErrorThrottle switch_error_;
 
             // Current state
             uint8_t enabled_;

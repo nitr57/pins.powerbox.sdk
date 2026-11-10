@@ -25,6 +25,7 @@
 #ifndef TCA953X_H
 #define TCA953X_H
 
+#include "ErrorThrottle.h"
 #include <stdint.h>
 
 template <uint8_t PINS>
@@ -46,6 +47,7 @@ class TCA953X_
 
         bool init_;
         uint8_t lastInput_[2];  /* last good input port read per register, used when a read fails */
+        PowerBox::ErrorThrottle ioError_;  /* rate limits the log while the bus keeps failing */
         int i2c_fd_;
         const char* dev_;
         uint8_t address_;

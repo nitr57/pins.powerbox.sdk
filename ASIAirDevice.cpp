@@ -225,7 +225,8 @@ namespace PowerBox
         if (i < 0 || i >= ASIAIR_NUM_POWER_PORTS)
             return false;
 
-        this->gpio_->digitalWrite(ASIAIR_PWR_PINS[i], state ? 1 : 0);
+        if (!this->gpio_->digitalWrite(ASIAIR_PWR_PINS[i], state ? 1 : 0))
+            return false;
         this->powerState[i] = state;
         return true;
     }

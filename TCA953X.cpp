@@ -197,6 +197,9 @@ bool TCA953X_<PINS>::writeRegister_(uint8_t reg, uint8_t val)
 
     for (int attempt = 0; attempt < I2C_ATTEMPTS; ++attempt) {
         if (write(this->i2c_fd_, buffer, 2) == 2) {
+            if (this->ioError_.succeed()) {
+                PB_INFO("TCA953X: I2C access works again");
+            }
             return true;
         }
         if (attempt + 1 < I2C_ATTEMPTS) {
@@ -204,7 +207,9 @@ bool TCA953X_<PINS>::writeRegister_(uint8_t reg, uint8_t val)
         }
     }
 
-    PB_ERROR("TCA953X writeRegister: failed to write register 0x%02x", reg);
+    if (this->ioError_.fail()) {
+        PB_ERROR("TCA953X writeRegister: failed to write register 0x%02x (%u failures)", reg, this->ioError_.failures());
+    }
     return false;
 }
 
@@ -219,6 +224,9 @@ bool TCA953X_<PINS>::readRegister_(uint8_t reg, uint8_t &data)
     for (int attempt = 0; attempt < I2C_ATTEMPTS; ++attempt) {
         // Write register address, then read 1 byte
         if (write(this->i2c_fd_, &reg, 1) == 1 && read(this->i2c_fd_, &data, 1) == 1) {
+            if (this->ioError_.succeed()) {
+                PB_INFO("TCA953X: I2C access works again");
+            }
             return true;
         }
         if (attempt + 1 < I2C_ATTEMPTS) {
@@ -226,7 +234,9 @@ bool TCA953X_<PINS>::readRegister_(uint8_t reg, uint8_t &data)
         }
     }
 
-    PB_ERROR("TCA953X readRegister: failed to read register 0x%02x", reg);
+    if (this->ioError_.fail()) {
+        PB_ERROR("TCA953X readRegister: failed to read register 0x%02x (%u failures)", reg, this->ioError_.failures());
+    }
     return false;
 }
 

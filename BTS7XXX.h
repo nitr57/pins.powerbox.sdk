@@ -25,6 +25,7 @@
 #ifndef BTS7XXX_H
 #define BTS7XXX_H
 
+#include "ErrorThrottle.h"
 #include <stdint.h>
 
 namespace PowerBox
@@ -45,10 +46,10 @@ namespace PowerBox
             void setSampling(uint8_t n, uint16_t delay = 0);
             void setMaxCurrent(float maxCurrent);
 
-            void enable(void);
-            void disable(void);
-            void toggle(void);
-            void setState(uint8_t state);
+            bool enable(void);
+            bool disable(void);
+            bool toggle(void);
+            bool setState(uint8_t state);
 
             void measureCurrent(void);
 
@@ -101,6 +102,9 @@ namespace PowerBox
             // Over current flag
             uint8_t over_current_;
 
+            // Rate limits the log for a pin that keeps failing to switch
+            ErrorThrottle switch_error_;
+
             // Fault current
             static constexpr float iis_fault_ = 4.4f;
     };
@@ -121,7 +125,7 @@ namespace PowerBox
         virtual void     setChannel(uint8_t ch) = 0;
         virtual void     setSampling(uint8_t n, uint16_t delay) = 0;
         virtual void     setMaxCurrent(float maxCurrent) = 0;
-        virtual void     setState(uint8_t state) = 0;
+        virtual bool     setState(uint8_t state) = 0;
         virtual void     measureCurrent() = 0;
         virtual uint16_t getCurrent_mA() const = 0;
         virtual uint8_t  getState() const = 0;
@@ -138,7 +142,7 @@ namespace PowerBox
         void     setChannel(uint8_t ch) override           { bts_.setChannel(ch); }
         void     setSampling(uint8_t n, uint16_t delay) override { bts_.setSampling(n, delay); }
         void     setMaxCurrent(float maxCurrent) override  { bts_.setMaxCurrent(maxCurrent); }
-        void     setState(uint8_t state) override          { bts_.setState(state); }
+        bool     setState(uint8_t state) override          { return bts_.setState(state); }
         void     measureCurrent() override                 { bts_.measureCurrent(); }
         uint16_t getCurrent_mA() const override            { return bts_.getCurrent_mA(); }
         uint8_t  getState() const override                 { return bts_.getState(); }
