@@ -26,6 +26,7 @@
 #include "PowerBoxLogging.h"
 #include "MCP320X.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include <filesystem>
 #include <mutex>
 #include <fstream>
@@ -248,8 +249,20 @@ namespace PowerBox
 
         while(this->statusListenerRunning)
         {
-            // Fetch MCP3202 data
-            this->GetMCP3202Data();
+            // An exception escaping a std::thread terminates the whole process
+            try
+            {
+                // Fetch MCP3202 data
+                this->GetMCP3202Data();
+            }
+            catch (const std::exception &e)
+            {
+                PB_ERROR("StatusListener: %s", e.what());
+            }
+            catch (...)
+            {
+                PB_ERROR("StatusListener: unknown exception");
+            }
 
             // 1 sec delay before we query again
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -323,8 +336,7 @@ namespace PowerBox
 
     std::string PinsBoxLightDevice::GetSerial(void)
     {
-        std::string serial = this->GetFullSerial();
-        return serial.substr(serial.length() - 7);
+        return ShortSerial(this->GetFullSerial());
     }
 
     int PinsBoxLightDevice::GetUpTime(void)
@@ -335,20 +347,7 @@ namespace PowerBox
 
     float PinsBoxLightDevice::GetCoreTemp(void)
     {
-        float temp = -127.f;
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-
-        if (ifs)
-        {
-            std::string line;
-            if (std::getline(ifs, line))
-            {
-                // Convert millidegrees to degrees
-                temp = std::stoi(line) / 1000.f;
-            }
-        }
-
-        return temp;
+        return ReadCoreTemp(-127.f);
     }
 
     float PinsBoxLightDevice::GetSupply12AverageA(void)
@@ -363,30 +362,41 @@ namespace PowerBox
         return this->supply12Ah / uptimeHours;
     }
 
+    static const char *SETTINGS_FILE = "/home/pi/pins/deviceSettings.json";
+
     void PinsBoxLightDevice::LoadSettings(void)
     {
-        std::ifstream file("/home/pi/pins/deviceSettings.json");
-        if (!file.is_open()) {
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile(SETTINGS_FILE, root);
+        if (result == SettingsLoad::Missing) {
             PB_DEBUG("Settings file not found, creating with defaults");
             SaveSettings();
             return;
         }
+        if (result != SettingsLoad::Ok) {
+            return;
+        }
 
-        Json::Value root;
-        file >> root;
-        file.close();
-
-        // Load power port bootstrap states
-        if (root.isMember("powerPorts")) {
-            Json::Value powerPorts = root["powerPorts"];
-            for (int i = 0; i < PINSBOX_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
-                if (this->powerReadOnly[i] == true) {
-                    this->powerBootstrap[i] = true;
-                } else {
-                    int idx = powerPorts[i].get("port", 0).asInt();
-                    this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+        // LoadSettings runs inside PBScan, unexpected value types must not
+        // throw across the C API, fall back to defaults instead
+        try {
+            // Load power port bootstrap states
+            const Json::Value &powerPorts = root["powerPorts"];
+            if (powerPorts.isArray()) {
+                for (int i = 0; i < PINSBOX_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
+                    if (this->powerReadOnly[i] == true) {
+                        this->powerBootstrap[i] = true;
+                    } else {
+                        int idx = powerPorts[i].get("port", 0).asInt();
+                        if (idx >= 0 && idx < PINSBOX_NUM_POWER_PORTS) {
+                            this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                        }
+                    }
                 }
             }
+        } catch (const std::exception &e) {
+            PB_ERROR("LoadSettings: failed to read settings, using defaults (%s)", e.what());
+            this->ResetProperties();
         }
     }
 
@@ -400,20 +410,23 @@ namespace PowerBox
             root["powerPorts"][i]["bootState"] = this->powerBootstrap[i];
         }
 
-        std::ofstream file("/home/pi/pins/deviceSettings.json");
-        if (file.is_open()) {
-            file << root;
-            file.close();
+        if (SaveSettingsFile(SETTINGS_FILE, root)) {
             PB_DEBUG("Settings saved");
         }
     }
 
     void PinsBoxLightDevice::GetMCP3202Data(void)
     {
+        // hwMutex_ is taken per measurement block instead of for the whole pass,
+        // so an API call waits for at most one block
+
         // Supply
-        this->supply_->measureCurrent();
-        this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
-        this->supply12V = this->adc_->analogReadAverage(1, 20, 0) * (36e3 + 4.7e3) / 4.7e3 * 0.001f;
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->supply_->measureCurrent();
+            this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
+            this->supply12V = this->adc_->analogReadAverage(1, 20, 0) * (36e3 + 4.7e3) / 4.7e3 * 0.001f;
+        }
 
         // Accumulate energy (called every 1 second)
         // Time delta: 1 second = 1/3600 hours
@@ -428,6 +441,7 @@ namespace PowerBox
         // PWR ports
         for(int i = 0; i < PINSBOX_NUM_POWER_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
@@ -436,14 +450,16 @@ namespace PowerBox
 
     int PinsBoxLightDevice::GetPowerState(int i)
     {
+        if (i < 0 || i >= PINSBOX_NUM_POWER_PORTS) {
+            return 0;
+        }
+
         // Read only port is always on
         if (this->powerReadOnly[i] == true) {
             return 1;
         }
 
-        if (i < 0 || i >= PINSBOX_NUM_POWER_PORTS) {
-            return 0;
-        }
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
 
         uint8_t state = this->pwr_[i]->getState();
         this->powerState[i] = state;
@@ -452,14 +468,16 @@ namespace PowerBox
 
     bool PinsBoxLightDevice::SetPowerState(int i, int state)
     {
+        if (i < 0 || i >= PINSBOX_NUM_POWER_PORTS) {
+            return false;
+        }
+
         // Port is read only
         if (this->powerReadOnly[i] == true) {
             return false;
         }
 
-        if (i < 0 || i >= PINSBOX_NUM_POWER_PORTS) {
-            return false;
-        }
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
 
         this->pwr_[i]->setState(state);
         this->powerState[i] = state;
@@ -512,7 +530,8 @@ namespace PowerBox
     bool ScanPinsBoxLight(int *ids)
     {
         // Check if this is a Raspberry PI
-        if(!ids || !IsRPI() || !std::filesystem::exists("/etc/pinsLightDevice"))
+        std::error_code fsError;
+        if(!ids || !IsRPI() || !std::filesystem::exists("/etc/pinsLightDevice", fsError))
         {
             return false;
         }

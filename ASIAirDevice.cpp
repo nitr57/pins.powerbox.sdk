@@ -25,6 +25,7 @@
 #include "ASIAirDevice.h"
 #include "PowerBoxLogging.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include "PWM.h"
 #include <filesystem>
 #include <mutex>
@@ -206,15 +207,7 @@ namespace PowerBox
 
     float ASIAirDevice::GetCoreTemp(void)
     {
-        float temp = -127.f;
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-        if (ifs)
-        {
-            std::string line;
-            if (std::getline(ifs, line))
-                temp = std::stoi(line) / 1000.f;
-        }
-        return temp;
+        return ReadCoreTemp(-127.f);
     }
 
     int ASIAirDevice::GetPowerState(int i)
@@ -249,27 +242,36 @@ namespace PowerBox
 
     void ASIAirDevice::LoadSettings(void)
     {
-        std::ifstream file("/home/pi/pins/asiairSettings.json");
-        if (!file.is_open())
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile("/home/pi/pins/asiairSettings.json", root);
+        if (result == SettingsLoad::Missing)
         {
             PB_DEBUG("Settings file not found, creating with defaults");
             SaveSettings();
             return;
         }
+        if (result != SettingsLoad::Ok)
+            return;
 
-        Json::Value root;
-        file >> root;
-        file.close();
-
-        if (root.isMember("powerPorts"))
+        /* LoadSettings runs inside PBScan, unexpected value types must not
+         * throw across the C API, fall back to defaults instead */
+        try
         {
-            Json::Value powerPorts = root["powerPorts"];
-            for (int i = 0; i < ASIAIR_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++)
+            if (root["powerPorts"].isArray())
             {
-                int idx = powerPorts[i].get("port", i).asInt();
-                if (idx >= 0 && idx < ASIAIR_NUM_POWER_PORTS)
-                    this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                const Json::Value &powerPorts = root["powerPorts"];
+                for (int i = 0; i < ASIAIR_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++)
+                {
+                    int idx = powerPorts[i].get("port", i).asInt();
+                    if (idx >= 0 && idx < ASIAIR_NUM_POWER_PORTS)
+                        this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                }
             }
+        }
+        catch (const std::exception &e)
+        {
+            PB_ERROR("LoadSettings: failed to read settings, using defaults (%s)", e.what());
+            this->ResetProperties();
         }
     }
 
@@ -283,13 +285,8 @@ namespace PowerBox
             root["powerPorts"][i]["bootState"] = this->powerBootstrap[i];
         }
 
-        std::ofstream file("/home/pi/pins/asiairSettings.json");
-        if (file.is_open())
-        {
-            file << root;
-            file.close();
+        if (SaveSettingsFile("/home/pi/pins/asiairSettings.json", root))
             PB_DEBUG("Settings saved");
-        }
     }
 
     PB_ERROR_TYPE ASIAirDevice::Beep(int volume, int duration_ms)

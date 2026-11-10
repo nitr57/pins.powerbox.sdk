@@ -25,6 +25,8 @@
 #include "DHT22.h"
 #include "DS18B20.h"
 #include <fstream>
+#include <cstdlib>
+#include <cmath>
 
 namespace PowerBox
 {
@@ -53,11 +55,17 @@ namespace PowerBox
 
         if(!val.empty())
         {
-            last.value = std::stof(val) * 0.001f;
-            last.valid = true;
-            last.time = now;
+            // strtof instead of std::stof, a garbled read must not throw and kill the DHT22 thread
+            char *end = nullptr;
+            float raw = std::strtof(val.c_str(), &end);
+            if(end != val.c_str() && std::isfinite(raw))
+            {
+                last.value = raw * 0.001f;
+                last.valid = true;
+                last.time = now;
 
-            return last.value;
+                return last.value;
+            }
         }
 
         // The kernel dht11 driver fails reads regularly, keep the last good value for a while

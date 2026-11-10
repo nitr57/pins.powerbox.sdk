@@ -25,6 +25,7 @@
 #include "StellaVitaDevice.h"
 #include "PowerBoxLogging.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include <filesystem>
 #include <mutex>
 #include <fstream>
@@ -261,20 +262,7 @@ namespace PowerBox
 
     float StellaVitaDevice::GetCoreTemp(void)
     {
-        float temp = -127.f;
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-
-        if (ifs)
-        {
-            std::string line;
-            if (std::getline(ifs, line))
-            {
-                // Convert millidegrees to degrees
-                temp = std::stoi(line) / 1000.f;
-            }
-        }
-
-        return temp;
+        return ReadCoreTemp(-127.f);
     }
 
     int StellaVitaDevice::GetPowerState(int i)
@@ -350,38 +338,47 @@ namespace PowerBox
 
     void StellaVitaDevice::LoadSettings(void)
     {
-        std::ifstream file("/home/pi/pins/stellavitaSettings.json");
-        if (!file.is_open())
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile("/home/pi/pins/stellavitaSettings.json", root);
+        if (result == SettingsLoad::Missing)
         {
             PB_DEBUG("Settings file not found, creating with defaults");
             SaveSettings();
             return;
         }
+        if (result != SettingsLoad::Ok)
+            return;
 
-        Json::Value root;
-        file >> root;
-        file.close();
-
-        if (root.isMember("powerPorts"))
+        /* LoadSettings runs inside PBScan, unexpected value types must not
+         * throw across the C API, fall back to defaults instead */
+        try
         {
-            Json::Value powerPorts = root["powerPorts"];
-            for (int i = 0; i < STELLAVITA_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++)
+            if (root["powerPorts"].isArray())
             {
-                int idx = powerPorts[i].get("port", i).asInt();
-                if (idx >= 0 && idx < STELLAVITA_NUM_POWER_PORTS)
-                    this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                const Json::Value &powerPorts = root["powerPorts"];
+                for (int i = 0; i < STELLAVITA_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++)
+                {
+                    int idx = powerPorts[i].get("port", i).asInt();
+                    if (idx >= 0 && idx < STELLAVITA_NUM_POWER_PORTS)
+                        this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                }
+            }
+
+            if (root["usbPorts"].isArray())
+            {
+                const Json::Value &usbPorts = root["usbPorts"];
+                for (int i = 0; i < STELLAVITA_NUM_USB_PORTS && i < (int)usbPorts.size(); i++)
+                {
+                    int idx = usbPorts[i].get("port", i).asInt();
+                    if (idx >= 0 && idx < STELLAVITA_NUM_USB_PORTS)
+                        this->usbBootstrap[idx] = usbPorts[i].get("bootState", 1).asInt();
+                }
             }
         }
-
-        if (root.isMember("usbPorts"))
+        catch (const std::exception &e)
         {
-            Json::Value usbPorts = root["usbPorts"];
-            for (int i = 0; i < STELLAVITA_NUM_USB_PORTS && i < (int)usbPorts.size(); i++)
-            {
-                int idx = usbPorts[i].get("port", i).asInt();
-                if (idx >= 0 && idx < STELLAVITA_NUM_USB_PORTS)
-                    this->usbBootstrap[idx] = usbPorts[i].get("bootState", 1).asInt();
-            }
+            PB_ERROR("LoadSettings: failed to read settings, using defaults (%s)", e.what());
+            this->ResetProperties();
         }
     }
 
@@ -401,13 +398,8 @@ namespace PowerBox
             root["usbPorts"][i]["bootState"] = this->usbBootstrap[i];
         }
 
-        std::ofstream file("/home/pi/pins/stellavitaSettings.json");
-        if (file.is_open())
-        {
-            file << root;
-            file.close();
+        if (SaveSettingsFile("/home/pi/pins/stellavitaSettings.json", root))
             PB_DEBUG("Settings saved");
-        }
     }
 
     static bool IsRPI(void)

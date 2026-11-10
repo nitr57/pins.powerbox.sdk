@@ -35,6 +35,7 @@
 #include "ADJ.h"
 #include "PWM.h"
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <limits>
@@ -175,6 +176,9 @@ namespace PowerBox
             std::thread statusListenerThread_;
             std::thread dht22Thread_;
             std::atomic<bool> dht22ThreadRunning_{false};
+            /* Serializes access to the shared SPI/GPIO hardware between the
+             * listener thread and SDK API calls */
+            std::mutex hwMutex_;
             std::chrono::steady_clock::time_point lastEnergyUpdate_;
             std::chrono::steady_clock::time_point sessionStart_;
             bool energyUpdateInitialized_ = false;

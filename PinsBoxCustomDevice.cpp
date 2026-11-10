@@ -25,6 +25,7 @@
 #include "PinsBoxCustomDevice.h"
 #include "PowerBoxLogging.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -78,7 +79,7 @@ namespace PowerBox
      * Parse /etc/pinsCustomDevice into cfg.
      * Returns false on any parse or validation error.
      */
-    static bool ParseCustomConfig(PinsBoxCustomHWConfig& cfg)
+    static bool ParseCustomConfigImpl(PinsBoxCustomHWConfig& cfg)
     {
         std::ifstream file(CUSTOM_CONFIG_PATH);
         if (!file.is_open())
@@ -178,6 +179,21 @@ namespace PowerBox
         PB_DEBUG("pinsCustomDevice: parsed '%s' — %zu power port(s), %zu PWM port(s)",
                  cfg.name.c_str(), cfg.power_ports.size(), cfg.pwm_ports.size());
         return true;
+    }
+
+    /* The config is edited by hand and parsed inside PBScan: a value of the wrong
+     * type makes jsoncpp throw, which must not escape through the C API */
+    static bool ParseCustomConfig(PinsBoxCustomHWConfig& cfg)
+    {
+        try
+        {
+            return ParseCustomConfigImpl(cfg);
+        }
+        catch (const std::exception &e)
+        {
+            PB_ERROR("pinsCustomDevice: invalid " CUSTOM_CONFIG_PATH " (%s)", e.what());
+            return false;
+        }
     }
 
     /* -------------------------------------------------------------------------
@@ -366,13 +382,7 @@ namespace PowerBox
 
     float PinsBoxCustomDevice::GetCoreTemp(void)
     {
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-        if (!ifs) return -127.f;
-
-        std::string line;
-        if (std::getline(ifs, line))
-            return std::stoi(line) / 1000.f;
-        return -127.f;
+        return ReadCoreTemp(-127.f);
     }
 
     /* -------------------------------------------------------------------------
@@ -471,27 +481,36 @@ namespace PowerBox
 
     void PinsBoxCustomDevice::LoadSettings(void)
     {
-        std::ifstream file(CUSTOM_SETTINGS_PATH);
-        if (!file.is_open())
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile(CUSTOM_SETTINGS_PATH, root);
+        if (result == SettingsLoad::Missing)
         {
             PB_DEBUG("PinsBoxCustom: settings file not found, using defaults");
             SaveSettings();
             return;
         }
+        if (result != SettingsLoad::Ok)
+            return;
 
-        Json::Value root;
-        file >> root;
-        file.close();
-
-        if (root.isMember("powerPorts"))
+        /* LoadSettings runs inside PBScan, unexpected value types must not
+         * throw across the C API, fall back to defaults instead */
+        try
         {
             const Json::Value& ports = root["powerPorts"];
-            for (int i = 0; i < static_cast<int>(ports.size()) && i < PB_MAX_POWER_PORTS; ++i)
+            if (ports.isArray())
             {
-                int idx = ports[i].get("port", i).asInt();
-                if (idx >= 0 && idx < PB_MAX_POWER_PORTS)
-                    this->powerBootstrap[idx] = ports[i].get("bootState", 0).asInt();
+                for (int i = 0; i < static_cast<int>(ports.size()) && i < PB_MAX_POWER_PORTS; ++i)
+                {
+                    int idx = ports[i].get("port", i).asInt();
+                    if (idx >= 0 && idx < PB_MAX_POWER_PORTS)
+                        this->powerBootstrap[idx] = ports[i].get("bootState", 0).asInt();
+                }
             }
+        }
+        catch (const std::exception &e)
+        {
+            PB_ERROR("PinsBoxCustom: failed to read settings, using defaults (%s)", e.what());
+            std::fill(std::begin(this->powerBootstrap), std::end(this->powerBootstrap), 0);
         }
     }
 
@@ -504,17 +523,8 @@ namespace PowerBox
             root["powerPorts"][i]["bootState"] = this->powerBootstrap[i];
         }
 
-        std::ofstream file(CUSTOM_SETTINGS_PATH);
-        if (file.is_open())
-        {
-            file << root;
-            file.close();
+        if (SaveSettingsFile(CUSTOM_SETTINGS_PATH, root))
             PB_DEBUG("PinsBoxCustom: settings saved");
-        }
-        else
-        {
-            PB_ERROR("PinsBoxCustom: failed to write settings to " CUSTOM_SETTINGS_PATH);
-        }
     }
 
     /* -------------------------------------------------------------------------
@@ -523,7 +533,8 @@ namespace PowerBox
 
     bool ScanPinsBoxCustom(int *ids)
     {
-        if (!ids || !IsRPI() || !std::filesystem::exists(CUSTOM_CONFIG_PATH))
+        std::error_code fsError;
+        if (!ids || !IsRPI() || !std::filesystem::exists(CUSTOM_CONFIG_PATH, fsError))
             return false;
 
         std::lock_guard<std::mutex> lock(g_globalMutex);

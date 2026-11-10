@@ -26,10 +26,12 @@
 #include "PowerBoxLogging.h"
 #include "MCP320X.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include <filesystem>
 #include <mutex>
 #include <fstream>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
@@ -309,9 +311,15 @@ namespace PowerBox
         /* Stop any existing listener by setting the flag */
         this->statusListenerRunning = false;
 
-        /* Wait for old thread to exit if it's still running */
+        this->dht22ThreadRunning_ = false;
+
+        /* Wait for old threads to exit if they are still running, assigning
+         * to a joinable std::thread would call std::terminate */
         if(this->statusListenerThread_.joinable()) {
             this->statusListenerThread_.join();
+        }
+        if(this->dht22Thread_.joinable()) {
+            this->dht22Thread_.join();
         }
 
         /* Start new listener thread */
@@ -355,8 +363,20 @@ namespace PowerBox
 
         while(this->statusListenerRunning)
         {
-            // Fetch MCP3208 data (fast SPI/I2C — runs every ~1s)
-            this->GetMCP3208Data();
+            // An exception escaping a std::thread terminates the whole process
+            try
+            {
+                // Fetch MCP3208 data (fast SPI/I2C — runs every ~1s)
+                this->GetMCP3208Data();
+            }
+            catch (const std::exception &e)
+            {
+                PB_ERROR("StatusListener: %s", e.what());
+            }
+            catch (...)
+            {
+                PB_ERROR("StatusListener: unknown exception");
+            }
 
             // 1 sec delay before we query again
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -371,8 +391,26 @@ namespace PowerBox
 
         while(this->dht22ThreadRunning_)
         {
-            this->GetDHT22Data();
-            std::this_thread::sleep_for(std::chrono::seconds(this->envUpdateRate));
+            // An exception escaping a std::thread terminates the whole process
+            try
+            {
+                this->GetDHT22Data();
+            }
+            catch (const std::exception &e)
+            {
+                PB_ERROR("DHT22Thread: %s", e.what());
+            }
+            catch (...)
+            {
+                PB_ERROR("DHT22Thread: unknown exception");
+            }
+
+            // Sleep in short steps so StopStatusListener does not wait up to envUpdateRate seconds
+            auto wakeUp = std::chrono::steady_clock::now() + std::chrono::seconds(this->envUpdateRate);
+            while(this->dht22ThreadRunning_ && std::chrono::steady_clock::now() < wakeUp)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
 
         PB_DEBUG("DHT22Thread: exiting");
@@ -421,7 +459,7 @@ namespace PowerBox
         std::ifstream file("/proc/device-tree/serial-number");
         if(!file.is_open())
         {
-            return nullptr;
+            return "";
         }
 
         std::string serial;
@@ -432,8 +470,7 @@ namespace PowerBox
 
     std::string PinsBoxDevice::GetSerial(void)
     {
-        std::string serial = this->GetFullSerial();
-        return serial.substr(serial.length() - 7);
+        return ShortSerial(this->GetFullSerial());
     }
 
     int PinsBoxDevice::GetUpTime(void)
@@ -444,20 +481,7 @@ namespace PowerBox
 
     float PinsBoxDevice::GetCoreTemp(void)
     {
-        float temp = DEVICE_DISCONNECTED_C;
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-
-        if (ifs)
-        {
-            std::string line;
-            if (std::getline(ifs, line))
-            {
-                // Convert millidegrees to degrees
-                temp = std::stoi(line) / 1000.f;
-            }
-        }
-
-        return temp;
+        return ReadCoreTemp(DEVICE_DISCONNECTED_C);
     }
 
     float PinsBoxDevice::GetSupply12AverageA(void)
@@ -508,101 +532,123 @@ namespace PowerBox
         return false;
     }
 
+    static const char *SETTINGS_FILE = "/home/pi/pins/deviceSettings.json";
+
+    static bool IsValidIndex(int idx, int count)
+    {
+        return idx >= 0 && idx < count;
+    }
+
     void PinsBoxDevice::LoadSettings(void)
     {
-        std::ifstream file("/home/pi/pins/deviceSettings.json");
-        if (!file.is_open()) {
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile(SETTINGS_FILE, root);
+        if (result == SettingsLoad::Missing) {
             PB_DEBUG("Settings file not found, creating with defaults");
             SaveSettings();
             return;
         }
-        
-        Json::Value root;
-        file >> root;
-        file.close();
-        
-        // Load environment settings
-        if (root.isMember("environment")) {
-            this->temperatureOffset = root["environment"].get("temperatureOffset", 0.0).asFloat();
-            this->humidityOffset = root["environment"].get("humidityOffset", 0.0).asFloat();
+        if (result != SettingsLoad::Ok) {
+            return;
         }
 
-        // Load power port bootstrap states
-        if (root.isMember("powerPorts")) {
-            Json::Value powerPorts = root["powerPorts"];
-            this->powerBootstrap[0] = true;
-            for (int i = 1; i < PINSBOX_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
-                int idx = powerPorts[i].get("port", 0).asInt();
-                this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+        // LoadSettings runs inside PBScan, unexpected value types must not
+        // throw across the C API, fall back to defaults instead
+        try {
+
+            // Load environment settings
+            if (root["environment"].isObject()) {
+                this->temperatureOffset = root["environment"].get("temperatureOffset", 0.0).asFloat();
+                this->humidityOffset = root["environment"].get("humidityOffset", 0.0).asFloat();
             }
-        }
 
-        // Load USB port bootstrap states
-        if (root.isMember("usbPorts")) {
-            Json::Value usbPorts = root["usbPorts"];
-            for (int i = 0; i < PINSBOX_NUM_USB_PORTS && i < (int)usbPorts.size(); i++) {
-                int idx = usbPorts[i].get("port", 0).asInt();
-                this->usbBootstrap[idx] = usbPorts[i].get("bootState", 0).asInt();
+            // Load power port bootstrap states
+            const Json::Value &powerPorts = root["powerPorts"];
+            if (powerPorts.isArray()) {
+                this->powerBootstrap[0] = true;
+                for (int i = 1; i < PINSBOX_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
+                    int idx = powerPorts[i].get("port", 0).asInt();
+                    if (IsValidIndex(idx, PINSBOX_NUM_POWER_PORTS)) {
+                        this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                    }
+                }
             }
-        }
 
-        // Load Dew port auto mode states
-        if (root.isMember("dewPorts")) {
-            Json::Value dewPorts = root["dewPorts"];
-            for (int i = 0; i < PINSBOX_NUM_DEW_PORTS && i < (int)dewPorts.size(); i++) {
-                int idx = dewPorts[i].get("port", 0).asInt();
-                this->dewAuto[idx] = dewPorts[i].get("autoMode", 1).asInt();
-                this->dewThreshold[idx] = dewPorts[i].get("autoThreshold", 4).asFloat();
+            // Load USB port bootstrap states
+            const Json::Value &usbPorts = root["usbPorts"];
+            if (usbPorts.isArray()) {
+                for (int i = 0; i < PINSBOX_NUM_USB_PORTS && i < (int)usbPorts.size(); i++) {
+                    int idx = usbPorts[i].get("port", 0).asInt();
+                    if (IsValidIndex(idx, PINSBOX_NUM_USB_PORTS)) {
+                        this->usbBootstrap[idx] = usbPorts[i].get("bootState", 0).asInt();
+                    }
+                }
             }
-        }
 
-        // Load Buck port bootstrap states
-        if (root.isMember("buckPorts")) {
-            Json::Value buckPorts = root["buckPorts"];
-            this->buckBootstrap = buckPorts[0].get("bootState", 0).asInt();
-            this->buckVset = buckPorts[0].get("targetVoltage", 1).asFloat();
+            // Load Dew port auto mode states
+            const Json::Value &dewPorts = root["dewPorts"];
+            if (dewPorts.isArray()) {
+                for (int i = 0; i < PINSBOX_NUM_DEW_PORTS && i < (int)dewPorts.size(); i++) {
+                    int idx = dewPorts[i].get("port", 0).asInt();
+                    if (IsValidIndex(idx, PINSBOX_NUM_DEW_PORTS)) {
+                        this->dewAuto[idx] = dewPorts[i].get("autoMode", 1).asInt();
+                        this->dewThreshold[idx] = dewPorts[i].get("autoThreshold", 4).asFloat();
+                    }
+                }
+            }
+
+            // Load Buck port bootstrap states
+            const Json::Value &buckPorts = root["buckPorts"];
+            if (buckPorts.isArray() && buckPorts.size() > 0) {
+                this->buckBootstrap = buckPorts[0].get("bootState", 0).asInt();
+                this->buckVset = buckPorts[0].get("targetVoltage", 1).asFloat();
+            }
+        } catch (const std::exception &e) {
+            PB_ERROR("LoadSettings: failed to read settings, using defaults (%s)", e.what());
+            this->ResetProperties();
         }
     }
 
     void PinsBoxDevice::SaveSettings(void)
     {
-        Json::Value root;
-        
-        // Environment settings
-        root["environment"]["temperatureOffset"] = this->temperatureOffset;
-        root["environment"]["humidityOffset"] = this->humidityOffset;
-        
-        // Power port bootstrap states
-        root["powerPorts"][0]["port"] = 0;
-        root["powerPorts"][0]["bootState"] = 1;
-        for (int i = 1; i < PINSBOX_NUM_POWER_PORTS; i++) {
-            root["powerPorts"][i]["port"] = i;
-            root["powerPorts"][i]["bootState"] = this->powerBootstrap[i];
-        }
+        try {
+            Json::Value root;
 
-        // USB port bootstrap states
-        for (int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i) {
-            root["usbPorts"][i]["port"] = i;
-            root["usbPorts"][i]["bootState"] = this->usbBootstrap[i];
-        }
-        
-        // Dew port automode states
-        for (int i = 0; i < PINSBOX_NUM_DEW_PORTS; ++i) {
-            root["dewPorts"][i]["port"] = i;
-            root["dewPorts"][i]["autoMode"] = this->dewAuto[i];
-            root["dewPorts"][i]["autoThreshold"] = this->dewThreshold[i];
-        }
+            // Environment settings
+            root["environment"]["temperatureOffset"] = this->temperatureOffset;
+            root["environment"]["humidityOffset"] = this->humidityOffset;
 
-        // Buck port bootstrap states
-        root["buckPorts"][0]["port"] = 0;
-        root["buckPorts"][0]["bootState"] = this->buckBootstrap;
-        root["buckPorts"][0]["targetVoltage"] = this->buckVset;
+            // Power port bootstrap states
+            root["powerPorts"][0]["port"] = 0;
+            root["powerPorts"][0]["bootState"] = 1;
+            for (int i = 1; i < PINSBOX_NUM_POWER_PORTS; i++) {
+                root["powerPorts"][i]["port"] = i;
+                root["powerPorts"][i]["bootState"] = this->powerBootstrap[i];
+            }
 
-        std::ofstream file("/home/pi/pins/deviceSettings.json");
-        if (file.is_open()) {
-            file << root;
-            file.close();
-            PB_DEBUG("Settings saved");
+            // USB port bootstrap states
+            for (int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i) {
+                root["usbPorts"][i]["port"] = i;
+                root["usbPorts"][i]["bootState"] = this->usbBootstrap[i];
+            }
+
+            // Dew port automode states
+            for (int i = 0; i < PINSBOX_NUM_DEW_PORTS; ++i) {
+                root["dewPorts"][i]["port"] = i;
+                root["dewPorts"][i]["autoMode"] = this->dewAuto[i];
+                root["dewPorts"][i]["autoThreshold"] = this->dewThreshold[i];
+            }
+
+            // Buck port bootstrap states
+            root["buckPorts"][0]["port"] = 0;
+            root["buckPorts"][0]["bootState"] = this->buckBootstrap;
+            root["buckPorts"][0]["targetVoltage"] = this->buckVset;
+
+            if (SaveSettingsFile(SETTINGS_FILE, root)) {
+                PB_DEBUG("Settings saved");
+            }
+        } catch (const std::exception &e) {
+            PB_ERROR("SaveSettings: %s", e.what());
         }
     }
 
@@ -663,11 +709,17 @@ namespace PowerBox
 
     void PinsBoxDevice::GetMCP3208Data(void)
     {
+        // hwMutex_ is taken per measurement block instead of for the whole pass,
+        // so an API call waits for at most one block (a dew port is the longest)
+
         // Supply
-        this->supply_->measureCurrent();
-        this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
-        this->supply12V = this->adc_->analogReadAverage(1, 20, 0) * (36e3 + 4.7e3) / 4.7e3 * 0.001f;
-        this->supply5V = this->adc_->analogReadAverage(0, 20, 0) * (35.7e3 + 10e3) / 10e3 * 0.001f;
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->supply_->measureCurrent();
+            this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
+            this->supply12V = this->adc_->analogReadAverage(1, 20, 0) * (36e3 + 4.7e3) / 4.7e3 * 0.001f;
+            this->supply5V = this->adc_->analogReadAverage(0, 20, 0) * (35.7e3 + 10e3) / 10e3 * 0.001f;
+        }
 
         // Accumulate energy using actual elapsed time
         auto now = std::chrono::steady_clock::now();
@@ -687,6 +739,7 @@ namespace PowerBox
         // PWR ports
         for(int i = 0; i < PINSBOX_NUM_POWER_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
@@ -694,6 +747,7 @@ namespace PowerBox
         
         for(int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->usb_[i]->measureVoltage();
             this->usb_[i]->measureCurrent();
             
@@ -705,6 +759,7 @@ namespace PowerBox
         // Dew ports
         for(int i = 0; i < PINSBOX_NUM_DEW_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dew_[i]->update(this->dewPoint, this->dewThreshold[i]);
             this->dewCurrent[i] = this->dew_[i]->getCurrent_mA() * 0.001f;
             this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
@@ -714,19 +769,25 @@ namespace PowerBox
         }
 
         // Adjustable ports
-        this->buck_->setSupplyVoltage(this->supply12V);
-        this->buck_->measureCurrent();
-        this->buckVmin = this->buck_->getMinVoltage();
-        this->buckVmax = this->buck_->getMaxVoltage();
-        this->buckVset = this->buck_->getTargetVoltage();
-        this->buckVoltage = this->buck_->getVoltage();
-        this->buckCurrent = this->buck_->getCurrent_mA() * 0.001f;
-        this->buckOvercurrent = this->buck_->getOverCurrent() ? 1 : 0;
-        this->buckOvervoltage = this->buck_->getOverVoltage() ? 1 : 0;
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->buck_->setSupplyVoltage(this->supply12V);
+            this->buck_->measureCurrent();
+            this->buckVmin = this->buck_->getMinVoltage();
+            this->buckVmax = this->buck_->getMaxVoltage();
+            this->buckVset = this->buck_->getTargetVoltage();
+            this->buckVoltage = this->buck_->getVoltage();
+            this->buckCurrent = this->buck_->getCurrent_mA() * 0.001f;
+            this->buckOvercurrent = this->buck_->getOverCurrent() ? 1 : 0;
+            this->buckOvervoltage = this->buck_->getOverVoltage() ? 1 : 0;
+        }
 
-        this->pwm_->measureCurrent();
-        this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
-        this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->pwm_->measureCurrent();
+            this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
+            this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+        }
     }
 
     int PinsBoxDevice::GetNumPowerPorts(void) const
@@ -756,6 +817,7 @@ namespace PowerBox
 
     int PinsBoxDevice::GetPowerState(int i)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         // Port 0 is always on
         if (i == 0) {
             return 1;
@@ -772,6 +834,7 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetPowerState(int i, int state)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         // Port 0 is always on
         if (i == 0) {
             return false;
@@ -795,6 +858,7 @@ namespace PowerBox
 
     int PinsBoxDevice::GetUSBState(int i)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         if (i < 0 || i >= PINSBOX_NUM_USB_PORTS) {
             return 0;
         }
@@ -806,6 +870,7 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetUSBState(int i, int state)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         if (i < 0 || i >= PINSBOX_NUM_USB_PORTS) {
             return false;
         }
@@ -832,6 +897,7 @@ namespace PowerBox
 
     int PinsBoxDevice::GetDewState(int i)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         if (i < 0 || i >= PINSBOX_NUM_DEW_PORTS) {
             return 0;
         }
@@ -844,6 +910,7 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetDewState(int i, int state, int power)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         if (i < 0 || i >= PINSBOX_NUM_DEW_PORTS) {
             return false;
         }
@@ -861,8 +928,11 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetDewAutoMode(int i, int state)
     {
-        this->dewAuto[i] = state;
-        this->dew_[i]->setAutoMode(state);
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->dewAuto[i] = state;
+            this->dew_[i]->setAutoMode(state);
+        }
         SaveSettings();
         return true;
     }
@@ -876,6 +946,7 @@ namespace PowerBox
 
     int PinsBoxDevice::GetBuckState(void)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         uint8_t state = this->buck_->getState();
         this->buckState = state;
         this->buckVmin = this->buck_->getMinVoltage();
@@ -885,10 +956,13 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetBuckState(int state, float target)
     {
-        this->buck_->setState(state, target);
-        this->buckState = state;
-	this->buckVset = target;
-	SaveSettings();
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->buck_->setState(state, target);
+            this->buckState = state;
+            this->buckVset = target;
+        }
+        SaveSettings();
         return true;
     }
 
@@ -901,6 +975,7 @@ namespace PowerBox
 
     int PinsBoxDevice::GetPWMState(void)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         uint8_t state = this->pwm_->getState();
         this->pwmState = state;
         this->pwmPWM = this->pwm_->getDutyCycle();
@@ -909,6 +984,7 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetPWMState(int state, int power)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
         this->pwmState = state;
         this->pwmPWM = power;
@@ -987,7 +1063,8 @@ namespace PowerBox
     bool ScanPinsBox(int *ids)
     {
         // Check if this is a Raspberry PI CM5
-        if(!ids || !IsCM5() || !std::filesystem::exists("/etc/pinsDevice"))
+        std::error_code fsError;
+        if(!ids || !IsCM5() || !std::filesystem::exists("/etc/pinsDevice", fsError))
         {
             return false;
         }

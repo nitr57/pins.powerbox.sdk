@@ -30,6 +30,7 @@
 #include "BTS7XXX.h"
 #include "MCP320X.h"
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <limits>
@@ -166,6 +167,9 @@ namespace PowerBox
             BTSPort<MCP3202>* pwr_[PINSBOX_LIGHT_NUM_POWER_PORTS];
 
             std::thread statusListenerThread_;
+            /* Serializes access to the shared SPI/GPIO hardware between the
+             * listener thread and SDK API calls */
+            std::mutex hwMutex_;
             std::chrono::steady_clock::time_point sessionStart_;
     };
 

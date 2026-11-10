@@ -27,6 +27,7 @@
 #include <chrono>
 #include <string>
 #include <fstream>
+#include <cstdlib>
 
 PWM::PWM(const char* chip, int ch)
 {
@@ -70,13 +71,15 @@ bool PWM::setState(bool state)
 unsigned int PWM::getPeriod(void) const
 {
     std::string val = this->read_(this->chip_ + "/pwm" + std::to_string(this->channel_) + "/period");
-    return val.empty() ? 0 : std::stoul(val);
+    // strtoul instead of std::stoul, this runs in device threads and must not throw
+    return val.empty() ? 0 : (unsigned int)std::strtoul(val.c_str(), nullptr, 10);
 }
 
 unsigned int PWM::getDutyCycle(void) const
 {
     std::string val = this->read_(this->chip_ + "/pwm" + std::to_string(this->channel_) + "/duty_cycle");
-    return val.empty() ? 0 : std::stoul(val);
+    // strtoul instead of std::stoul, this runs in device threads and must not throw
+    return val.empty() ? 0 : (unsigned int)std::strtoul(val.c_str(), nullptr, 10);
 }
 
 int PWM::getState(void) const

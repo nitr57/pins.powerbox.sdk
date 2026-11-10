@@ -26,6 +26,7 @@
 #include "PowerBoxLogging.h"
 #include "MCP320X.h"
 #include "Device.h"
+#include "DeviceUtil.h"
 #include <filesystem>
 #include <mutex>
 #include <fstream>
@@ -298,9 +299,15 @@ namespace PowerBox
         /* Stop any existing listener by setting the flag */
         this->statusListenerRunning = false;
 
-        /* Wait for old thread to exit if it's still running */
+        this->dht22ThreadRunning_ = false;
+
+        /* Wait for old threads to exit if they are still running, assigning
+         * to a joinable std::thread would call std::terminate */
         if(this->statusListenerThread_.joinable()) {
             this->statusListenerThread_.join();
+        }
+        if(this->dht22Thread_.joinable()) {
+            this->dht22Thread_.join();
         }
 
         /* Start new listener thread */
@@ -344,8 +351,20 @@ namespace PowerBox
 
         while(this->statusListenerRunning)
         {
-            // Fetch MCP3202 data (fast SPI — runs every ~1s)
-            this->GetMCP3202Data();
+            // An exception escaping a std::thread terminates the whole process
+            try
+            {
+                // Fetch MCP3202 data (fast SPI — runs every ~1s)
+                this->GetMCP3202Data();
+            }
+            catch (const std::exception &e)
+            {
+                PB_ERROR("StatusListener: %s", e.what());
+            }
+            catch (...)
+            {
+                PB_ERROR("StatusListener: unknown exception");
+            }
 
             // 1 sec delay before we query again
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -360,8 +379,26 @@ namespace PowerBox
 
         while(this->dht22ThreadRunning_)
         {
-            this->GetDHT22Data();
-            std::this_thread::sleep_for(std::chrono::seconds(this->envUpdateRate));
+            // An exception escaping a std::thread terminates the whole process
+            try
+            {
+                this->GetDHT22Data();
+            }
+            catch (const std::exception &e)
+            {
+                PB_ERROR("DHT22Thread: %s", e.what());
+            }
+            catch (...)
+            {
+                PB_ERROR("DHT22Thread: unknown exception");
+            }
+
+            // Sleep in short steps so StopStatusListener does not wait up to envUpdateRate seconds
+            auto wakeUp = std::chrono::steady_clock::now() + std::chrono::seconds(this->envUpdateRate);
+            while(this->dht22ThreadRunning_ && std::chrono::steady_clock::now() < wakeUp)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
 
         PB_DEBUG("DHT22Thread: exiting");
@@ -417,8 +454,7 @@ namespace PowerBox
 
     std::string PinsBoxMiniDevice::GetSerial(void)
     {
-        std::string serial = this->GetFullSerial();
-        return serial.substr(serial.length() - 7);
+        return ShortSerial(this->GetFullSerial());
     }
 
     int PinsBoxMiniDevice::GetUpTime(void)
@@ -429,20 +465,7 @@ namespace PowerBox
 
     float PinsBoxMiniDevice::GetCoreTemp(void)
     {
-        float temp = DEVICE_DISCONNECTED_C;
-        std::ifstream ifs("/sys/class/thermal/thermal_zone0/temp");
-
-        if (ifs)
-        {
-            std::string line;
-            if (std::getline(ifs, line))
-            {
-                // Convert millidegrees to degrees
-                temp = std::stoi(line) / 1000.f;
-            }
-        }
-
-        return temp;
+        return ReadCoreTemp(DEVICE_DISCONNECTED_C);
     }
 
     float PinsBoxMiniDevice::GetSupply12AverageA(void)
@@ -493,42 +516,60 @@ namespace PowerBox
         return false;
     }
 
+    static const char *SETTINGS_FILE = "/home/pi/pins/deviceSettings.json";
+
+    static bool IsValidIndex(int idx, int count)
+    {
+        return idx >= 0 && idx < count;
+    }
+
     void PinsBoxMiniDevice::LoadSettings(void)
     {
-        std::ifstream file("/home/pi/pins/deviceSettings.json");
-        if (!file.is_open()) {
+        Json::Value root;
+        SettingsLoad result = LoadSettingsFile(SETTINGS_FILE, root);
+        if (result == SettingsLoad::Missing) {
             PB_DEBUG("Settings file not found, creating with defaults");
             SaveSettings();
             return;
         }
-
-        Json::Value root;
-        file >> root;
-        file.close();
-
-        // Load environment settings
-        if (root.isMember("environment")) {
-            this->temperatureOffset = root["environment"].get("temperatureOffset", 0.0).asFloat();
-            this->humidityOffset = root["environment"].get("humidityOffset", 0.0).asFloat();
+        if (result != SettingsLoad::Ok) {
+            return;
         }
 
-        // Load power port bootstrap states
-        if (root.isMember("powerPorts")) {
-            Json::Value powerPorts = root["powerPorts"];
-            for (int i = 0; i < PINSBOXMINI_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
-                int idx = powerPorts[i].get("port", 0).asInt();
-                this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+        // LoadSettings runs inside PBScan, unexpected value types must not
+        // throw across the C API, fall back to defaults instead
+        try {
+            // Load environment settings
+            if (root["environment"].isObject()) {
+                this->temperatureOffset = root["environment"].get("temperatureOffset", 0.0).asFloat();
+                this->humidityOffset = root["environment"].get("humidityOffset", 0.0).asFloat();
             }
-        }
 
-        // Load Dew port auto mode states
-        if (root.isMember("dewPorts")) {
-            Json::Value dewPorts = root["dewPorts"];
-            for (int i = 0; i < PINSBOXMINI_NUM_DEW_PORTS && i < (int)dewPorts.size(); i++) {
-                int idx = dewPorts[i].get("port", 0).asInt();
-                this->dewAuto[idx] = dewPorts[i].get("autoMode", 1).asInt();
-                this->dewThreshold[idx] = dewPorts[i].get("autoThreshold", 4).asFloat();
+            // Load power port bootstrap states
+            const Json::Value &powerPorts = root["powerPorts"];
+            if (powerPorts.isArray()) {
+                for (int i = 0; i < PINSBOXMINI_NUM_POWER_PORTS && i < (int)powerPorts.size(); i++) {
+                    int idx = powerPorts[i].get("port", 0).asInt();
+                    if (IsValidIndex(idx, PINSBOXMINI_NUM_POWER_PORTS)) {
+                        this->powerBootstrap[idx] = powerPorts[i].get("bootState", 0).asInt();
+                    }
+                }
             }
+
+            // Load Dew port auto mode states
+            const Json::Value &dewPorts = root["dewPorts"];
+            if (dewPorts.isArray()) {
+                for (int i = 0; i < PINSBOXMINI_NUM_DEW_PORTS && i < (int)dewPorts.size(); i++) {
+                    int idx = dewPorts[i].get("port", 0).asInt();
+                    if (IsValidIndex(idx, PINSBOXMINI_NUM_DEW_PORTS)) {
+                        this->dewAuto[idx] = dewPorts[i].get("autoMode", 1).asInt();
+                        this->dewThreshold[idx] = dewPorts[i].get("autoThreshold", 4).asFloat();
+                    }
+                }
+            }
+        } catch (const std::exception &e) {
+            PB_ERROR("LoadSettings: failed to read settings, using defaults (%s)", e.what());
+            this->ResetProperties();
         }
     }
 
@@ -553,10 +594,7 @@ namespace PowerBox
             root["dewPorts"][i]["autoThreshold"] = this->dewThreshold[i];
         }
 
-        std::ofstream file("/home/pi/pins/deviceSettings.json");
-        if (file.is_open()) {
-            file << root;
-            file.close();
+        if (SaveSettingsFile(SETTINGS_FILE, root)) {
             PB_DEBUG("Settings saved");
         }
     }
@@ -618,17 +656,24 @@ namespace PowerBox
 
     void PinsBoxMiniDevice::GetMCP3202Data(void)
     {
-        // Total input current (BTS7006). Read first and in isolation: driving
-        // DSEL high enables only the supply sense (all port DENs are low).
-        this->supply_->measureCurrent();
-        this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
+        // hwMutex_ is taken per measurement block instead of for the whole pass,
+        // so an API call waits for at most one block (a dew port is the longest)
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
 
-        // 12V supply sense (ADC channel 1, divider 36k / 4.7k)
-        this->supply12V = this->adc_->analogReadAverage(ADC_CH_12V, 20, 0) * (SUPPLY_R1 + SUPPLY_R2) / SUPPLY_R2 * 0.001f;
+            // Total input current (BTS7006). Read first and in isolation: driving
+            // DSEL high enables only the supply sense (all port DENs are low).
+            this->supply_->measureCurrent();
+            this->supply12A = this->supply_->getCurrent_mA() * 0.001f;
+
+            // 12V supply sense (ADC channel 1, divider 36k / 4.7k)
+            this->supply12V = this->adc_->analogReadAverage(ADC_CH_12V, 20, 0) * (SUPPLY_R1 + SUPPLY_R2) / SUPPLY_R2 * 0.001f;
+        }
 
         // 12V power ports
         for(int i = 0; i < PINSBOXMINI_NUM_POWER_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->pwr_[i]->measureCurrent();
             this->powerCurrent[i] = this->pwr_[i]->getCurrent_mA() * 0.001f;
             this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
@@ -637,6 +682,7 @@ namespace PowerBox
         // Dew ports
         for(int i = 0; i < PINSBOXMINI_NUM_DEW_PORTS; ++i)
         {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dew_[i]->update(this->dewPoint, this->dewThreshold[i]);
             this->dewCurrent[i] = this->dew_[i]->getCurrent_mA() * 0.001f;
             this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
@@ -646,9 +692,12 @@ namespace PowerBox
         }
 
         // PWM 12V port
-        this->pwm_->measureCurrent();
-        this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
-        this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->pwm_->measureCurrent();
+            this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
+            this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
+        }
 
         // Correct the "sel 1" ports for the mis-wired BTS7006 sense bleeding onto
         // the shared IS line while DSEL is high: 12V #2 (pwr_[1], BTS7012), the
@@ -704,6 +753,8 @@ namespace PowerBox
             return 0;
         }
 
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
+
         uint8_t state = this->pwr_[i]->getState();
         this->powerState[i] = state;
         return state;
@@ -714,6 +765,8 @@ namespace PowerBox
         if (i < 0 || i >= PINSBOXMINI_NUM_POWER_PORTS) {
             return false;
         }
+
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
 
         this->pwr_[i]->setState(state);
         this->powerState[i] = state;
@@ -737,6 +790,8 @@ namespace PowerBox
             return 0;
         }
 
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
+
         uint8_t state = this->dew_[i]->getState();
         this->dewState[i] = state;
         this->dewPWM[i] = this->dew_[i]->getDutyCycle();
@@ -748,6 +803,8 @@ namespace PowerBox
         if (i < 0 || i >= PINSBOXMINI_NUM_DEW_PORTS) {
             return false;
         }
+
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
 
         // On auto mode, do nothing
         if (dewAuto[i]) {
@@ -766,8 +823,11 @@ namespace PowerBox
             return false;
         }
 
-        this->dewAuto[i] = state;
-        this->dew_[i]->setAutoMode(state);
+        {
+            std::lock_guard<std::mutex> lock(this->hwMutex_);
+            this->dewAuto[i] = state;
+            this->dew_[i]->setAutoMode(state);
+        }
         SaveSettings();
         return true;
     }
@@ -785,6 +845,7 @@ namespace PowerBox
 
     int PinsBoxMiniDevice::GetPWMState(void)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         uint8_t state = this->pwm_->getState();
         this->pwmState = state;
         this->pwmPWM = this->pwm_->getDutyCycle();
@@ -793,6 +854,7 @@ namespace PowerBox
 
     bool PinsBoxMiniDevice::SetPWMState(int state, int power)
     {
+        std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
         this->pwmState = state;
         this->pwmPWM = power;
@@ -858,7 +920,8 @@ namespace PowerBox
     bool ScanPinsBoxMini(int *ids)
     {
         // Check if this is a Raspberry Pi with the mini-device marker present
-        if(!ids || !IsRPI() || !std::filesystem::exists("/etc/pinsMiniDevice"))
+        std::error_code fsError;
+        if(!ids || !IsRPI() || !std::filesystem::exists("/etc/pinsMiniDevice", fsError))
         {
             return false;
         }
