@@ -31,6 +31,10 @@
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 
+/* Transient I2C errors happen now and then, retry before giving up */
+static const int I2C_ATTEMPTS = 3;
+static const useconds_t I2C_RETRY_DELAY_US = 500;
+
 template <uint8_t PINS>
 TCA953X_<PINS>::TCA953X_(const char* dev, uint8_t address)
 {
@@ -38,6 +42,8 @@ TCA953X_<PINS>::TCA953X_(const char* dev, uint8_t address)
     this->dev_ = dev;
     this->address_ = address;
     this->i2c_fd_ = -1;
+    this->lastInput_[0] = 0;
+    this->lastInput_[1] = 0;
 }
 
 template <uint8_t PINS>
@@ -96,7 +102,14 @@ uint8_t TCA953X_<PINS>::pinMode(uint8_t pin, uint8_t mode)
 
     uint8_t config = PINS > 8 ? (pin < 8 ? 0x06 : 0x07) : 0x03;
     uint8_t mask   = 1 << (pin < 8 ? pin : pin - 8);
-    uint8_t val    = this->readRegister_(config);
+    uint8_t val;
+
+    // Never write back after a failed read: val would be 0 and turn every
+    // other pin of this register into an output
+    if(!this->readRegister_(config, val))
+    {
+        return false;
+    }
 
     if(mode == INPUT)
     {
@@ -108,9 +121,7 @@ uint8_t TCA953X_<PINS>::pinMode(uint8_t pin, uint8_t mode)
         val &= ~mask;
     }
 
-    this->writeRegister_(config, val);
-
-    return true;
+    return this->writeRegister_(config, val);
 }
 
 template <uint8_t PINS>
@@ -123,7 +134,14 @@ uint8_t TCA953X_<PINS>::digitalWrite(uint8_t pin, uint8_t data)
 
     uint8_t config = PINS > 8 ? (pin < 8 ? 0x02 : 0x03) : 0x01;
     uint8_t mask   = 1 << (pin < 8 ? pin : pin - 8);
-    uint8_t val    = this->readRegister_(config);
+    uint8_t val;
+
+    // Never write back after a failed read: val would be 0 and switch off
+    // every other output of this register
+    if(!this->readRegister_(config, val))
+    {
+        return false;
+    }
 
     if(data)
     {
@@ -134,9 +152,7 @@ uint8_t TCA953X_<PINS>::digitalWrite(uint8_t pin, uint8_t data)
         val &= ~mask;
     }
 
-    this->writeRegister_(config, val);
-
-    return true;
+    return this->writeRegister_(config, val);
 }
 
 template <uint8_t PINS>
@@ -149,7 +165,17 @@ uint8_t TCA953X_<PINS>::digitalRead(uint8_t pin)
 
     uint8_t config = PINS > 8 ? (pin < 8 ? 0x00 : 0x01) : 0x00;
     uint8_t mask   = 1 << (pin < 8 ? pin : pin - 8);
-    uint8_t val    = this->readRegister_(config);
+    uint8_t val;
+
+    // On a failed read report the last known state instead of "all low"
+    if(this->readRegister_(config, val))
+    {
+        this->lastInput_[config] = val;
+    }
+    else
+    {
+        val = this->lastInput_[config];
+    }
 
     if(val & mask)
     {
@@ -160,39 +186,48 @@ uint8_t TCA953X_<PINS>::digitalRead(uint8_t pin)
 }
 
 template <uint8_t PINS>
-uint8_t TCA953X_<PINS>::writeRegister_(uint8_t reg, uint8_t val)
+bool TCA953X_<PINS>::writeRegister_(uint8_t reg, uint8_t val)
 {
-    uint8_t buffer[2] = { reg, val };
-
-    if (write(this->i2c_fd_, buffer, 2) != 2) {
+    if (this->i2c_fd_ < 0) {
+        PB_DEBUG("TCA953X writeRegister: i2c_fd_ is invalid (%d)", this->i2c_fd_);
         return false;
     }
 
-    return true;
+    uint8_t buffer[2] = { reg, val };
+
+    for (int attempt = 0; attempt < I2C_ATTEMPTS; ++attempt) {
+        if (write(this->i2c_fd_, buffer, 2) == 2) {
+            return true;
+        }
+        if (attempt + 1 < I2C_ATTEMPTS) {
+            usleep(I2C_RETRY_DELAY_US);
+        }
+    }
+
+    PB_ERROR("TCA953X writeRegister: failed to write register 0x%02x", reg);
+    return false;
 }
 
 template <uint8_t PINS>
-uint8_t TCA953X_<PINS>::readRegister_(uint8_t reg)
+bool TCA953X_<PINS>::readRegister_(uint8_t reg, uint8_t &data)
 {
     if (this->i2c_fd_ < 0) {
         PB_DEBUG("TCA953X readRegister: i2c_fd_ is invalid (%d)", this->i2c_fd_);
-        return 0;
+        return false;
     }
 
-    // Write register address
-    if (write(this->i2c_fd_, &reg, 1) != 1) {
-        PB_DEBUG("TCA953X readRegister: failed to write register address 0x%02x", reg);
-        return 0;
+    for (int attempt = 0; attempt < I2C_ATTEMPTS; ++attempt) {
+        // Write register address, then read 1 byte
+        if (write(this->i2c_fd_, &reg, 1) == 1 && read(this->i2c_fd_, &data, 1) == 1) {
+            return true;
+        }
+        if (attempt + 1 < I2C_ATTEMPTS) {
+            usleep(I2C_RETRY_DELAY_US);
+        }
     }
 
-    // Read 1 byte
-    uint8_t data;
-    if (read(this->i2c_fd_, &data, 1) != 1) {
-        PB_DEBUG("TCA953X readRegister: failed to read register 0x%02x", reg);
-        return 0;
-    }
-
-    return data;
+    PB_ERROR("TCA953X readRegister: failed to read register 0x%02x", reg);
+    return false;
 }
 
 template class TCA953X_<8>;

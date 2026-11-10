@@ -41,10 +41,11 @@ class TCA953X_
         uint8_t digitalRead(uint8_t pin);
 
     private:
-        uint8_t writeRegister_(uint8_t reg, uint8_t data);
-        uint8_t readRegister_(uint8_t reg);
+        bool writeRegister_(uint8_t reg, uint8_t data);
+        bool readRegister_(uint8_t reg, uint8_t &data);
 
         bool init_;
+        uint8_t lastInput_[2];  /* last good input port read per register, used when a read fails */
         int i2c_fd_;
         const char* dev_;
         uint8_t address_;

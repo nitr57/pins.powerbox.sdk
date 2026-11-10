@@ -158,13 +158,19 @@ namespace PowerBox
 
         PB_DEBUG("GPIOManager::begin() - tca_->begin() succeeded");
 
-        // Set output pins
+        // Set output pins. Keep going after a failure, so one failing pin
+        // does not leave all following pins unconfigured
+        bool pinsOk = true;
         for(int i = 0; i < this->tca_ngpio_; ++i)
         {
             if(!this->tca_->pinMode(this->tca_gpio_[i], OUTPUT)) {
-                PB_DEBUG("GPIOManager::begin() - pinMode OUTPUT failed");
-                return false;
+                PB_ERROR("GPIOManager::begin() - pinMode OUTPUT failed for TCA pin %u", this->tca_gpio_[i]);
+                pinsOk = false;
             }
+        }
+
+        if(!pinsOk) {
+            return false;
         }
 
         PB_DEBUG("GPIOManager::begin() completed successfully");
