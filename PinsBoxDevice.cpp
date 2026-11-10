@@ -508,6 +508,7 @@ namespace PowerBox
         if(val > -50.f && val < 80.f)
         {
             this->extTemperature = val;
+            this->extTime = std::chrono::steady_clock::now();
             this->extSensor = true;
             return true;
         }
@@ -526,6 +527,7 @@ namespace PowerBox
         if(val > 0.0f && val <= 100.0f)
         {
             this->extHumidity = val;
+            this->extTime = std::chrono::steady_clock::now();
             this->extSensor = true;
             return true;
         }
@@ -662,7 +664,13 @@ namespace PowerBox
            currentTemperature == DEVICE_DISCONNECTED_C ||
            currentHumidity == DEVICE_DISCONNECTED_C)
         {
-            if(std::isnan(this->extTemperature) ||
+            // External values (e.g. a weather station via the plugin) stay valid for
+            // the same grace period as the internal sensors, so a late update does not
+            // make the dew point disappear and switch the dew heaters off
+            bool extFresh = std::chrono::steady_clock::now() - this->extTime < SENSOR_GRACE_PERIOD;
+
+            if(!extFresh ||
+               std::isnan(this->extTemperature) ||
                std::isnan(this->extHumidity) ||
                this->extTemperature == DEVICE_DISCONNECTED_C ||
                this->extHumidity == DEVICE_DISCONNECTED_C)
@@ -701,10 +709,6 @@ namespace PowerBox
         this->humidity = currentHumidity;
         this->dewPoint = std::isnan(currentDewPoint) ? DEVICE_DISCONNECTED_C : currentDewPoint;
         this->dewPoint = std::min(this->dewPoint, currentTemperature);
-
-        // Reset external values
-        this->extTemperature = DEVICE_DISCONNECTED_C;
-        this->extHumidity = DEVICE_DISCONNECTED_C;
     }
 
     void PinsBoxDevice::GetMCP3208Data(void)

@@ -31,6 +31,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <string>
 
 namespace PowerBox
@@ -149,6 +150,7 @@ namespace PowerBox
         int extSensor = 0;
         float extTemperature = -127.0f;
         float extHumidity = -127.0f;
+        std::chrono::steady_clock::time_point extTime;  // last external temperature/humidity update
 
         // Supply status
         float supply12V = 0.0f;
