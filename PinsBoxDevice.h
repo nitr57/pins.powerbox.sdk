@@ -112,7 +112,7 @@ namespace PowerBox
 
             virtual int GetPWMState(void);
             virtual bool SetPWMState(int state, int power);
-            virtual bool GetPWMPower(void) { return this->pwmPWM; }
+            virtual int GetPWMPower(void) { return this->pwmPWM; }
             virtual bool ResetPWMOvercurrent(void)                                { return false; }
 
             virtual int GetFirmwareVersion() { return 1; }

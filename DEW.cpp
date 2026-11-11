@@ -24,6 +24,7 @@
 
 #include "DEW.h"
 #include "common.h"
+#include <algorithm>
 
 namespace PowerBox
 {
@@ -33,6 +34,7 @@ namespace PowerBox
         this->gpio_ = &gpio;
         this->mcp_ = &mcp;
         this->auto_mode_ = false;
+        this->hold_ = false;
 
         this->probe_ = new DS18B20(gpio);
         this->bts_ = new BTS7080<MCP>(gpio, mcp);
@@ -59,20 +61,48 @@ namespace PowerBox
     }
 
     template <typename MCP>
-    uint8_t DewPortT<MCP>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch)
+    uint8_t DewPortT<MCP>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch, int keptIn)
     {
         this->probe_->begin(probe_pin);
 
-        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port);
+        // Take the running port over only if its PWM channel is configured as
+        // expected, otherwise the duty cycle read back would be meaningless
+        unsigned int period = (unsigned int)(1e9 / freq);
+        bool keep = false;
+        if(keptIn >= 0 && this->pwm_->setExport())
+        {
+            keep = this->pwm_->getPeriod() == period;
+            if(!keep)
+            {
+                PB_INFO("Dew port %u: PWM not configured as expected, initialized off", port);
+            }
+        }
+
+        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, keep ? keptIn : 0);
         this->bts_->setMaxCurrent(3.f);
         this->bts_->setChannel(adc_ch);
         this->bts_->setSampling(100, 50);
 
+        if(keep)
+        {
+            this->auto_mode_ = mode;
+
+            // Hold a running heater in auto mode until the regulation has valid data
+            this->hold_ = mode && keptIn == 1;
+            this->hold_until_ = std::chrono::steady_clock::now() + SENSOR_GRACE_PERIOD;
+            return true;
+        }
+
         RETURN_IF_ERROR(this->pwm_->setExport());
-        RETURN_IF_ERROR(this->pwm_->setPeriod(1e9 / freq));
+        // Duty first (best effort): a duty above the new period would be rejected.
+        // Right after an export the period may still be 0, then this write fails.
+        this->pwm_->setDutyCycle(0);
+        RETURN_IF_ERROR(this->pwm_->setPeriod(period));
         RETURN_IF_ERROR(this->pwm_->setDutyCycle(0));
         RETURN_IF_ERROR(this->pwm_->setState(0));
 
+        // Auto mode only with a working PWM, it would otherwise switch the heater
+        // on with an unknown PWM state
         this->auto_mode_ = mode;
 
         return true;
@@ -91,11 +121,21 @@ namespace PowerBox
 
             if(temperature == DEVICE_DISCONNECTED_C || dewPoint == DEVICE_DISCONNECTED_C)
             {
-                // Turn off heater
-                this->setState_(0, 0);
+                if(this->hold_ && std::chrono::steady_clock::now() < this->hold_until_)
+                {
+                    // Taken over heater: keep its output until the data is valid
+                }
+                else
+                {
+                    // Turn off heater
+                    this->hold_ = false;
+                    this->setState_(0, 0);
+                }
             }
             else
             {
+                this->hold_ = false;
+
                 // Temperture difference between current and dew point
                 // e.g. Threshold ; Temp  ;  DP   ;  diff
                 //              4      20      15     -1  ;  heater should be inactive
@@ -132,6 +172,9 @@ namespace PowerBox
             this->bts_->resetOverCurrent();
         }
 
+        // A user action ends holding a taken over heater
+        this->hold_ = false;
+
         this->auto_mode_ = mode != 0;
     }
 
@@ -154,8 +197,10 @@ namespace PowerBox
             return 0;
         }
 
-        // Convert nanoseconds back to 0-255 scale
-        return (dutyCycle_ns * 255) / period;
+        // Convert nanoseconds back to 0-255 scale. Rounded: setting truncates
+        // (period * dc / 255), so truncating here as well would read back dc - 1
+        uint64_t dc = ((uint64_t)dutyCycle_ns * 255 + period / 2) / period;
+        return (uint8_t)std::min<uint64_t>(dc, 255);
     }
 
     template <typename MCP>
@@ -163,7 +208,7 @@ namespace PowerBox
     {
         // Convert duty cycle to nano seconds
         unsigned int period = this->pwm_->getPeriod();
-        unsigned int dc = (period * dutyCycle) / 255;
+        unsigned int dc = (unsigned int)(((uint64_t)period * dutyCycle) / 255);
 
         // Set duty cycle
         this->pwm_->setDutyCycle(dc);

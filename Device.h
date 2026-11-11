@@ -108,7 +108,7 @@ namespace PowerBox
 
             virtual int GetPWMState(void) = 0;
             virtual bool SetPWMState(int state, int power) = 0;
-            virtual bool GetPWMPower(void) = 0;
+            virtual int GetPWMPower(void) = 0;
             virtual bool ResetPWMOvercurrent(void) = 0;
 
             PB_ERROR_TYPE GetPowerPortStatus(PB_POWER_PORT_STATUS *status) const;

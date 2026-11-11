@@ -186,6 +186,56 @@ uint8_t TCA953X_<PINS>::digitalRead(uint8_t pin)
 }
 
 template <uint8_t PINS>
+bool TCA953X_<PINS>::readPair_(uint8_t reg, uint16_t &val)
+{
+    uint8_t lo = 0, hi = 0;
+    if(!this->readRegister_(reg, lo))
+    {
+        return false;
+    }
+    if(PINS > 8 && !this->readRegister_(reg + 1, hi))
+    {
+        return false;
+    }
+    val = (uint16_t)lo | ((uint16_t)hi << 8);
+    return true;
+}
+
+template <uint8_t PINS>
+bool TCA953X_<PINS>::writePair_(uint8_t reg, uint16_t val)
+{
+    if(!this->writeRegister_(reg, val & 0xFF))
+    {
+        return false;
+    }
+    return PINS <= 8 || this->writeRegister_(reg + 1, (val >> 8) & 0xFF);
+}
+
+template <uint8_t PINS>
+bool TCA953X_<PINS>::readOutputs(uint16_t &val)
+{
+    return this->readPair_(PINS > 8 ? 0x02 : 0x01, val);
+}
+
+template <uint8_t PINS>
+bool TCA953X_<PINS>::writeOutputs(uint16_t val)
+{
+    return this->writePair_(PINS > 8 ? 0x02 : 0x01, val);
+}
+
+template <uint8_t PINS>
+bool TCA953X_<PINS>::readConfig(uint16_t &val)
+{
+    return this->readPair_(PINS > 8 ? 0x06 : 0x03, val);
+}
+
+template <uint8_t PINS>
+bool TCA953X_<PINS>::writeConfig(uint16_t val)
+{
+    return this->writePair_(PINS > 8 ? 0x06 : 0x03, val);
+}
+
+template <uint8_t PINS>
 bool TCA953X_<PINS>::writeRegister_(uint8_t reg, uint8_t val)
 {
     if (this->i2c_fd_ < 0) {

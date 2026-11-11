@@ -53,10 +53,12 @@ namespace PowerBox
         delete this->dac_;
     }
 
-    uint8_t BuckPort::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state)
+    uint8_t BuckPort::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state, int keptEn)
     {
-        // Drives the enable pin low, the converter is off from here on
-        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port);
+        // A converter that is still running (taken over) keeps its enable line,
+        // otherwise the enable pin is driven low and the converter is off
+        bool running = keptEn == 1;
+        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, running ? 1 : 0);
         this->bts_->setMaxCurrent(3.0f);
         this->bts_->setChannel(2);
         this->bts_->setSampling(10, 1);
@@ -85,16 +87,44 @@ namespace PowerBox
         {
             // E.g. 0 V stored by an older version, or a rejected target that
             // was persisted. Never switch on with a voltage nobody asked for.
-            PB_ERROR("Buck: stored target voltage %.2f V is invalid, using %.2f V%s",
-                     target, this->voltage_target_ * 0.001f, state ? ", the buck stays off" : "");
+            if (running)
+            {
+                PB_ERROR("Buck: stored target voltage %.2f V is invalid, the running converter's DAC value is checked", target);
+            }
+            else
+            {
+                PB_ERROR("Buck: stored target voltage %.2f V is invalid, using %.2f V%s",
+                         target, this->voltage_target_ * 0.001f, state ? ", the buck stays off" : "");
+            }
             this->over_voltage_ = true;
         }
 
         if (!this->dac_->begin())
         {
             // Without a working DAC the output voltage is unknown, stay off
+            if (running)
+            {
+                PB_ERROR("Buck: DAC not readable, running converter switched off");
+            }
             this->bts_->setState(0);
             return false;
+        }
+
+        if (running)
+        {
+            bool ok = this->takeOverRunning_();
+            if (!ok && this->boot_target_invalid_)
+            {
+                // Switched off; setState(0) cleared the flag, the stored target was still rejected
+                this->over_voltage_ = true;
+            }
+            return ok;
+        }
+
+        // Taken over as off: the boot state does not apply
+        if (keptEn == 0)
+        {
+            state = 0;
         }
 
         // At power-on the DAC loads its EEPROM value. Keep the lowest output
@@ -269,14 +299,65 @@ namespace PowerBox
         return true;
     }
 
+    float BuckPort::dacVoltageFor_(int target)
+    {
+        // Required DAC voltage. ADJ_CAL is a measured calibration of the output
+        // voltage (see ADJ.h).
+        return std::min(SUPPLY_REF, ADJ_R2 * std::max(0.f, VMAX - target * ADJ_CAL) / ADJ_R1 * 0.001f);
+    }
+
     bool BuckPort::setVoltage_(int target)
     {
-        // Calculate required DAC voltage. ADJ_CAL is a measured calibration
-        // of the output voltage (see ADJ.h).
-        float Vdac = std::min(SUPPLY_REF, ADJ_R2 * std::max(0.f, VMAX - target * ADJ_CAL) / ADJ_R1 * 0.001f);
-
         // Set DAC accordingly, verified by reading it back
-        return this->dac_->setVoltage(Vdac);
+        return this->dac_->setVoltage(dacVoltageFor_(target));
+    }
+
+    bool BuckPort::takeOverRunning_(void)
+    {
+        // The converter was left running by an earlier process. Keep the voltage
+        // its DAC holds: no DAC write (the stored target may be stale), no EEPROM
+        // write (would set the DAC to the minimum for a moment; done at the next
+        // cold start). Switch off if the DAC value is not plausible.
+        uint16_t code = 0;
+        bool poweredDown = true;
+        if (!this->dac_->readDac(code, poweredDown) || poweredDown)
+        {
+            PB_ERROR("Buck: DAC of the running converter not readable or powered down, switched off");
+            this->setState(0, 0.f);
+            return false;
+        }
+
+        // Target the DAC value stands for (inverse of dacVoltageFor_)
+        float vdac_mV = code * SUPPLY_REF / 4095.f * 1000.f;
+        int derived = (int)lroundf((VMAX - vdac_mV * ADJ_R1 / ADJ_R2) / ADJ_CAL);
+
+        if (!this->inRange_(derived))
+        {
+            // E.g. the parked value (enable line high but DAC at the minimum)
+            PB_ERROR("Buck: running converter has an implausible DAC value (%u, %d mV), switched off", code, derived);
+            this->setState(0, 0.f);
+            return false;
+        }
+
+        uint16_t storedCode = (uint16_t)lroundf(dacVoltageFor_(this->voltage_target_) * 4095.f / SUPPLY_REF);
+        if (this->boot_target_invalid_ || code != storedCode)
+        {
+            if (this->boot_target_invalid_)
+            {
+                PB_INFO("Buck: running converter taken over at %.3f V (DAC value), stored target was invalid",
+                        derived * 0.001f);
+            }
+            else
+            {
+                PB_INFO("Buck: running converter taken over at %.3f V (DAC value), stored target was %.3f V",
+                        derived * 0.001f, this->voltage_target_ * 0.001f);
+            }
+            this->voltage_target_ = derived;
+            this->boot_target_invalid_ = false;
+        }
+
+        this->over_voltage_ = false;
+        return true;
     }
 
     bool BuckPort::parkDac_(void)
@@ -293,6 +374,7 @@ namespace PowerBox
 
         this->bts_ = new BTS7XXX_<MCP, kILIS>(gpio, mcp);
         this->pwm_ = new PWM(chip, ch);
+        this->taken_over_ = false;
     }
 
     template <typename MCP, uint16_t kILIS>
@@ -303,15 +385,36 @@ namespace PowerBox
     }
 
     template <typename MCP, uint16_t kILIS>
-    uint8_t PWMPortT<MCP, kILIS>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch, float maxCurrent)
+    uint8_t PWMPortT<MCP, kILIS>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch, float maxCurrent, int keptIn)
     {
-        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port);
+        // Take the running port over only if its PWM channel is configured as
+        // expected, otherwise the duty cycle read back would be meaningless
+        unsigned int period = (unsigned int)(1e9 / freq);
+        this->taken_over_ = false;
+        if(keptIn >= 0 && this->pwm_->setExport())
+        {
+            this->taken_over_ = this->pwm_->getPeriod() == period;
+            if(!this->taken_over_)
+            {
+                PB_INFO("PWM port %u: PWM not configured as expected, initialized off", port);
+            }
+        }
+
+        this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, this->taken_over_ ? keptIn : 0);
         this->bts_->setMaxCurrent(maxCurrent);
         this->bts_->setChannel(adc_ch);
         this->bts_->setSampling(100, 50);
 
+        if(this->taken_over_)
+        {
+            return true;
+        }
+
         RETURN_IF_ERROR(this->pwm_->setExport());
-        RETURN_IF_ERROR(this->pwm_->setPeriod(1e9 / freq));
+        // Duty first (best effort): a duty above the new period would be rejected.
+        // Right after an export the period may still be 0, then this write fails.
+        this->pwm_->setDutyCycle(0);
+        RETURN_IF_ERROR(this->pwm_->setPeriod(period));
         RETURN_IF_ERROR(this->pwm_->setDutyCycle(0));
         RETURN_IF_ERROR(this->pwm_->setState(0));
 
@@ -323,7 +426,7 @@ namespace PowerBox
     {
         // Convert duty cycle to nano seconds
         unsigned int period = this->pwm_->getPeriod();
-        unsigned int dutyCycle = period * dc / 255;
+        unsigned int dutyCycle = (unsigned int)(((uint64_t)period * dc) / 255);
 
         // Set duty cycle
         this->pwm_->setDutyCycle(dutyCycle);
@@ -349,8 +452,10 @@ namespace PowerBox
             return 0;
         }
 
-        // Convert nanoseconds back to 0-255 scale
-        return (dutyCycle_ns * 255) / period;
+        // Convert nanoseconds back to 0-255 scale. Rounded: setting truncates
+        // (period * dc / 255), so truncating here as well would read back dc - 1
+        uint64_t value = ((uint64_t)dutyCycle_ns * 255 + period / 2) / period;
+        return (uint8_t)std::min<uint64_t>(value, 255);
     }
 
     /* Explicit instantiations for the supported (ADC, BTS) combinations */

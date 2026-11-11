@@ -41,9 +41,18 @@ class TCA953X_
         uint8_t digitalWrite(uint8_t pin, uint8_t data);
         uint8_t digitalRead(uint8_t pin);
 
+        /* Whole port access (bit n = pin n). Output = output latch (not the pin
+         * level), config: 1 = input, 0 = output (power-on default 0xFFFF). */
+        bool readOutputs(uint16_t &val);
+        bool writeOutputs(uint16_t val);
+        bool readConfig(uint16_t &val);
+        bool writeConfig(uint16_t val);
+
     private:
         bool writeRegister_(uint8_t reg, uint8_t data);
         bool readRegister_(uint8_t reg, uint8_t &data);
+        bool readPair_(uint8_t reg, uint16_t &val);
+        bool writePair_(uint8_t reg, uint16_t val);
 
         bool init_;
         uint8_t lastInput_[2];  /* last good input port read per register, used when a read fails */

@@ -28,6 +28,7 @@
 #include <string>
 #include <fstream>
 #include <cstdlib>
+#include <sys/stat.h>
 
 PWM::PWM(const char* chip, int ch)
 {
@@ -44,6 +45,14 @@ bool PWM::setExport(void)
 {
     if(this->exported_)
     {
+        return true;
+    }
+
+    // Already exported (e.g. by an earlier process): keep it as it is
+    struct stat st;
+    if(stat((this->chip_ + "/pwm" + std::to_string(this->channel_)).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+    {
+        this->exported_ = true;
         return true;
     }
 

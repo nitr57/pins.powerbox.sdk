@@ -85,9 +85,11 @@ namespace PowerBox
             return false;
         }
 
-        // Find out what the DAC outputs right now
+        // Find out what the DAC outputs right now (with retries: a running
+        // converter is switched off if this fails)
         uint16_t dac;
-        if (!this->readState_(nullptr, &dac, nullptr, nullptr))
+        bool pd;
+        if (!this->readDac(dac, pd))
         {
             PB_ERROR("MCP4725: no response at 0x%02x", this->address_);
             close(this->i2c_fd_);
@@ -157,6 +159,31 @@ namespace PowerBox
         this->current_val_ = dac;
 
         return eeprom == val && eepromPd == 0;
+    }
+
+    bool MCP4725::readDac(uint16_t& code, bool& poweredDown)
+    {
+        if (this->i2c_fd_ < 0)
+        {
+            return false;
+        }
+
+        for (int attempt = 0; attempt < MCP4725_WRITE_RETRIES; attempt++)
+        {
+            uint8_t status;
+            if (this->readState_(&status, &code, nullptr, nullptr))
+            {
+                poweredDown = (status & MCP4725_STATUS_PD_MASK) != 0;
+                return true;
+            }
+
+            if (attempt + 1 < MCP4725_WRITE_RETRIES)
+            {
+                usleep(2000);
+            }
+        }
+
+        return false;
     }
 
     float MCP4725::getVoltage(void) const

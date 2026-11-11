@@ -37,7 +37,10 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <string>
 #include <json/json.h>
+#include <sys/stat.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -95,6 +98,79 @@ namespace PowerBox
     static const uint8_t ADJDEN_PIN = PINS[25];
     static const uint8_t *DS18_PINS = &PINS[26];
 
+    /* Boot states are applied once per Linux boot. The marker holds the boot id
+     * of the boot in which they were applied; /run/lock is a tmpfs (cleared at
+     * every boot), the boot id protects against a /run/lock that is not. */
+    static const char *BOOT_MARKER = "/run/lock/pinsbox.boot";
+
+    static std::string ReadBootId(void)
+    {
+        std::ifstream ifs("/proc/sys/kernel/random/boot_id");
+        std::string id;
+        if(!(ifs >> id))
+        {
+            PB_ERROR("PinsBox: boot id not readable, boot states are applied");
+            return "";
+        }
+        return id;
+    }
+
+    static bool IsSameBoot(const std::string &bootId)
+    {
+        if(bootId.empty())
+        {
+            return false;
+        }
+
+        std::ifstream ifs(BOOT_MARKER);
+        std::string id;
+        return (ifs >> id) && id == bootId;
+    }
+
+    static void WriteBootMarker(const std::string &bootId)
+    {
+        // Atomic (temp file + rename), so a reader never sees an empty marker;
+        // readable for every user (root and a normal user may both start the SDK)
+        // The temp file is created exclusively (never follows or reuses an
+        // existing path in the world writable directory); a leftover is removed once
+        std::string tmp = std::string(BOOT_MARKER) + "." + std::to_string(getpid());
+        const int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
+        int fd = open(tmp.c_str(), flags, 0644);
+        if(fd < 0 && errno == EEXIST)
+        {
+            unlink(tmp.c_str());
+            fd = open(tmp.c_str(), flags, 0644);
+        }
+        if(fd < 0)
+        {
+            int err = errno;
+            PB_ERROR("PinsBox: boot marker %s could not be written (%s), boot states will be applied again at the next start", BOOT_MARKER, strerror(err));
+            return;
+        }
+
+        std::string data = bootId + "\n";
+        int err = 0;
+        bool ok = write(fd, data.c_str(), data.size()) == (ssize_t)data.size();
+        if(!ok)
+        {
+            err = errno;
+        }
+        fchmod(fd, 0644);
+        close(fd);
+
+        if(ok && rename(tmp.c_str(), BOOT_MARKER) != 0)
+        {
+            ok = false;
+            err = errno;
+        }
+
+        if(!ok)
+        {
+            PB_ERROR("PinsBox: boot marker %s could not be written (%s), boot states will be applied again at the next start", BOOT_MARKER, err ? strerror(err) : "short write");
+            unlink(tmp.c_str());
+        }
+    }
+
     PinsBoxDevice::PinsBoxDevice(void)
     {
         this->statusListenerRunning = false;
@@ -119,7 +195,25 @@ namespace PowerBox
                                       NUM_PINS,
                                       PINS);
 
-        this->gpio_->begin();
+        // First SDK start in this Linux boot: apply the boot states. Later starts
+        // (e.g. NINA restarted) take the current port states over.
+        const std::string bootId = ReadBootId();
+        const bool sameBoot = IsSameBoot(bootId);
+        if(sameBoot)
+        {
+            PB_INFO("PinsBox: started again in the same boot, current port states are taken over");
+        }
+
+        // Switch pins (PINS[0..18]: USB_EN1-8, EN_BUCK, power ports, dew, PWM)
+        // keep an already configured output level, the 1-wire pins idle high,
+        // all other lines (sense enables, DSEL) start low.
+        const bool gpioOk = this->gpio_->begin(sameBoot, PINS, 19, DS18_PINS, 2);
+
+        // Taken over level, or the boot state
+        auto initState = [this](uint8_t pin, int bootState) {
+            int kept = this->gpio_->keptValue(pin);
+            return (uint8_t)(kept >= 0 ? kept : bootState);
+        };
 
         // ADC
         this->adc_ = new MCP3204(*this->gpio_);
@@ -145,13 +239,13 @@ namespace PowerBox
         // Initialize PWR ports
         this->pwr_[0]->begin(1200, PWRDEN_PINS[0], 255, DSEL_PIN, 0);
         this->powerState[0] = 1;  // port 0 has no switch and is always on
-        this->pwr_[1]->begin(1200, PWRDEN_PINS[0], PWR_PINS[0], DSEL_PIN, 1, this->powerBootstrap[1]);
-        this->pwr_[2]->begin(1200, PWRDEN_PINS[1], PWR_PINS[1], DSEL_PIN, 0, this->powerBootstrap[2]);
-        this->pwr_[3]->begin(1200, PWRDEN_PINS[1], PWR_PINS[2], DSEL_PIN, 1, this->powerBootstrap[3]);
-        this->pwr_[4]->begin(1200, PWRDEN_PINS[2], PWR_PINS[3], DSEL_PIN, 0, this->powerBootstrap[4]);
-        this->pwr_[5]->begin(1200, PWRDEN_PINS[2], PWR_PINS[4], DSEL_PIN, 1, this->powerBootstrap[5]);
-        this->pwr_[6]->begin(1200, PWRDEN_PINS[3], PWR_PINS[5], DSEL_PIN, 0, this->powerBootstrap[6]);
-        this->pwr_[7]->begin(1200, PWRDEN_PINS[3], PWR_PINS[6], DSEL_PIN, 1, this->powerBootstrap[7]);
+        this->pwr_[1]->begin(1200, PWRDEN_PINS[0], PWR_PINS[0], DSEL_PIN, 1, initState(PWR_PINS[0], this->powerBootstrap[1]));
+        this->pwr_[2]->begin(1200, PWRDEN_PINS[1], PWR_PINS[1], DSEL_PIN, 0, initState(PWR_PINS[1], this->powerBootstrap[2]));
+        this->pwr_[3]->begin(1200, PWRDEN_PINS[1], PWR_PINS[2], DSEL_PIN, 1, initState(PWR_PINS[2], this->powerBootstrap[3]));
+        this->pwr_[4]->begin(1200, PWRDEN_PINS[2], PWR_PINS[3], DSEL_PIN, 0, initState(PWR_PINS[3], this->powerBootstrap[4]));
+        this->pwr_[5]->begin(1200, PWRDEN_PINS[2], PWR_PINS[4], DSEL_PIN, 1, initState(PWR_PINS[4], this->powerBootstrap[5]));
+        this->pwr_[6]->begin(1200, PWRDEN_PINS[3], PWR_PINS[5], DSEL_PIN, 0, initState(PWR_PINS[5], this->powerBootstrap[6]));
+        this->pwr_[7]->begin(1200, PWRDEN_PINS[3], PWR_PINS[6], DSEL_PIN, 1, initState(PWR_PINS[6], this->powerBootstrap[7]));
 
         // PWR sense sample rate and max current
         for(int i = 0; i < PINSBOX_NUM_POWER_PORTS; ++i)
@@ -168,14 +262,16 @@ namespace PowerBox
         }
 
         // Initialize USB ports
-        this->usb_[0]->begin(USB_PINS[0], 0x40, 2.6f, this->usbBootstrap[0]);
-        this->usb_[1]->begin(USB_PINS[1], 0x41, 2.6f, this->usbBootstrap[1]);
-        this->usb_[2]->begin(USB_PINS[2], 0x42, 2.0f, this->usbBootstrap[2]);
-        this->usb_[3]->begin(USB_PINS[3], 0x43, 2.0f, this->usbBootstrap[3]);
-        this->usb_[5]->begin(USB_PINS[4], 0x44, 1.2f, this->usbBootstrap[4]);
-        this->usb_[4]->begin(USB_PINS[5], 0x45, 1.2f, this->usbBootstrap[5]);
-        this->usb_[6]->begin(USB_PINS[7], 0x47, 1.2f, this->usbBootstrap[6]);
-        this->usb_[7]->begin(USB_PINS[6], 0x46, 1.2f, this->usbBootstrap[7]);
+        // Ports 5/6 and 7/8 use swapped enable pins and INA219 addresses; the boot
+        // state always belongs to the API index (usb_[k] <- usbBootstrap[k])
+        this->usb_[0]->begin(USB_PINS[0], 0x40, 2.6f, initState(USB_PINS[0], this->usbBootstrap[0]));
+        this->usb_[1]->begin(USB_PINS[1], 0x41, 2.6f, initState(USB_PINS[1], this->usbBootstrap[1]));
+        this->usb_[2]->begin(USB_PINS[2], 0x42, 2.0f, initState(USB_PINS[2], this->usbBootstrap[2]));
+        this->usb_[3]->begin(USB_PINS[3], 0x43, 2.0f, initState(USB_PINS[3], this->usbBootstrap[3]));
+        this->usb_[5]->begin(USB_PINS[4], 0x44, 1.2f, initState(USB_PINS[4], this->usbBootstrap[5]));
+        this->usb_[4]->begin(USB_PINS[5], 0x45, 1.2f, initState(USB_PINS[5], this->usbBootstrap[4]));
+        this->usb_[6]->begin(USB_PINS[7], 0x47, 1.2f, initState(USB_PINS[7], this->usbBootstrap[6]));
+        this->usb_[7]->begin(USB_PINS[6], 0x46, 1.2f, initState(USB_PINS[6], this->usbBootstrap[7]));
 
         // Dew ports
         this->dew_ = new DewPort*[PINSBOX_NUM_DEW_PORTS];
@@ -183,12 +279,14 @@ namespace PowerBox
         this->dew_[1] = new DewPort(*this->gpio_, *this->adc_, "pwmchip1", 0);
 
         // Initialize Dew ports
-        this->dew_[0]->begin(DEWDEN_PIN, DEW_PINS[1], DSEL_PIN, DS18_PINS[0], 1, 400, this->dewAuto[0]);
-        this->dew_[1]->begin(DEWDEN_PIN, DEW_PINS[0], DSEL_PIN, DS18_PINS[1], 0, 400, this->dewAuto[1]);
+        // Dew ports have no boot state: off at the first start, taken over later
+        this->dew_[0]->begin(DEWDEN_PIN, DEW_PINS[1], DSEL_PIN, DS18_PINS[0], 1, 400, this->dewAuto[0], 2, this->gpio_->keptValue(DEW_PINS[1]));
+        this->dew_[1]->begin(DEWDEN_PIN, DEW_PINS[0], DSEL_PIN, DS18_PINS[1], 0, 400, this->dewAuto[1], 2, this->gpio_->keptValue(DEW_PINS[0]));
 
         // Initialize adjustable ports
         this->buck_ = new BuckPort(*this->gpio_, *this->adc_, "/dev/i2c-10", 0x60);
-        this->buck_->begin(ADJDEN_PIN, BUCK_PIN, DSEL_PIN, 0, this->buckVset, this->buckBootstrap);
+        const float loadedVset = this->buckVset;
+        this->buck_->begin(ADJDEN_PIN, BUCK_PIN, DSEL_PIN, 0, this->buckVset, this->buckBootstrap, this->gpio_->keptValue(BUCK_PIN));
 
         // Report what the port really uses right away, not only after the
         // first listener cycle (an invalid stored target may have been replaced)
@@ -210,14 +308,34 @@ namespace PowerBox
             }
             SaveSettings();
         }
+        // The target in use differs from the stored one (an old target limited to
+        // the highest target, or a running converter taken over with a different
+        // DAC value): store the target in use (compared in mV, no float compare)
+        else if (!(loadedVset >= 0.f && loadedVset <= 100.f) ||
+                 lroundf(loadedVset * 1000.f) != lroundf(this->buckVset * 1000.f))
+        {
+            SaveSettings();
+        }
 
+        // PWM port has no boot state: off at the first start, taken over later
         this->pwm_ = new PWMPort(*this->gpio_, *this->adc_);
-        this->pwm_->begin(ADJDEN_PIN, PWM_PIN, DSEL_PIN, 1, 30000);
-        this->pwm_->setState(0, 0.f);
+        this->pwm_->begin(ADJDEN_PIN, PWM_PIN, DSEL_PIN, 1, 30000, 2, 3.0f, this->gpio_->keptValue(PWM_PIN));
+        if(!this->pwm_->isTakenOver())
+        {
+            this->pwm_->setState(0, 0.f);
+        }
+        this->pwmState = this->pwm_->getState();
+        this->pwmPWM = this->pwm_->getDutyCycle();
 
         // Initialize buzzer PWM on GPIO16 (pwmchip2, channel 0)
         this->buzzer_ = new PWM("pwmchip2", 0);
         this->buzzer_->setExport();
+
+        // Boot states are written: later starts in this boot take the states over
+        if(gpioOk && !sameBoot && !bootId.empty())
+        {
+            WriteBootMarker(bootId);
+        }
     }
 
     PinsBoxDevice::~PinsBoxDevice(void)
@@ -818,6 +936,7 @@ namespace PowerBox
             this->pwmCurrent = this->pwm_->getCurrent_mA() * 0.001f;
             this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
             this->pwmState = this->pwm_->getState();
+            this->pwmPWM = this->pwm_->getDutyCycle();
         }
     }
 

@@ -54,15 +54,15 @@ set(SDK_SOURCES
     MCP320X.cpp
     TCA953X.cpp)
 
-# Detect libgpiod and append hardware sources when available
+# Detect libgpiod (v2 API, >= 2.0) and append hardware sources when available
 if(UNIX)
-    pkg_check_modules(LIBGPIOD libgpiod)
+    pkg_check_modules(LIBGPIOD libgpiod>=2.0)
 endif()
 
 if(LIBGPIOD_FOUND)
     list(APPEND SDK_SOURCES GPIOManager.cpp PinsBoxDevice.cpp PinsBoxLightDevice.cpp PinsBoxMiniDevice.cpp PinsBoxCustomDevice.cpp StellaVitaDevice.cpp ASIAirDevice.cpp)
 else()
-    message(STATUS "libgpiod not found. GPIO / PinsBox support will be disabled (install libgpiod-dev to enable)")
+    message(STATUS "libgpiod >= 2.0 not found. GPIO / PinsBox support will be disabled (install libgpiod-dev >= 2.0 to enable)")
 endif()
 
 # SDK Library
@@ -92,13 +92,13 @@ endif()
 
 # Find and link libgpiod
 if(UNIX)
-    pkg_check_modules(LIBGPIOD libgpiod)
+    pkg_check_modules(LIBGPIOD libgpiod>=2.0)
     if(LIBGPIOD_FOUND)
         target_compile_definitions(PowerBoxSDK PRIVATE HAVE_LIBGPIOD=1)
         target_include_directories(PowerBoxSDK PRIVATE ${LIBGPIOD_INCLUDE_DIRS})
         target_link_libraries(PowerBoxSDK PRIVATE ${LIBGPIOD_LIBRARIES})
     else()
-        message(STATUS "libgpiod not found. GPIO control may not work. Install with: sudo apt-get install libgpiod-dev")
+        message(STATUS "libgpiod >= 2.0 not found. GPIO control may not work. Install with: sudo apt-get install libgpiod-dev")
     endif()
 endif()
 

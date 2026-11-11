@@ -31,6 +31,7 @@
 #include "BTS7XXX.h"
 #include "DS18B20.h"
 #include <cstdint>
+#include <chrono>
 
 namespace PowerBox
 {
@@ -41,7 +42,11 @@ namespace PowerBox
             DewPortT(const GPIOManager& gpio, const MCP& mcp, const char* chip, int ch);
             ~DewPortT(void);
 
-            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch = 2);
+            /* keptIn: level of the power switch input taken over from an earlier
+             * process (-1 = none). If >= 0 and the PWM channel already runs with
+             * the requested period, the port is kept as it is (switch, duty,
+             * enable); otherwise it is initialized off. */
+            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch = 2, int keptIn = -1);
             void update(float dewPoint, float threshold);
 
             void enable(void) { this->bts_->enable(); }
@@ -70,6 +75,11 @@ namespace PowerBox
             PWM* pwm_;
 
             bool auto_mode_;
+
+            /* A heater taken over in auto mode keeps its output until probe and
+             * dew point are valid for the first time (at most SENSOR_GRACE_PERIOD) */
+            bool hold_;
+            std::chrono::steady_clock::time_point hold_until_;
     };
 
     /* Backward-compatible alias: the historical MCP3204-based dew port */

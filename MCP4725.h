@@ -50,6 +50,10 @@ namespace PowerBox
             /* Voltage the DAC currently outputs, as last read back from it */
             float getVoltage(void) const;
 
+            /* Reads the DAC register and whether the output is powered down
+             * (power down bits != 00), with retries */
+            bool readDac(uint16_t& code, bool& poweredDown);
+
         private:
             bool toValue_(float v, uint16_t* val) const;
             bool setValue_(uint16_t val);

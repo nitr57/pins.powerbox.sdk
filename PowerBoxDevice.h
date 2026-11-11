@@ -121,7 +121,7 @@ namespace PowerBox
 
             virtual int GetPWMState(void) { return this->pwmState; }
             virtual bool SetPWMState(int state, int power);
-            virtual bool GetPWMPower(void) { return this->pwmPWM; }
+            virtual int GetPWMPower(void) { return this->pwmPWM; }
             virtual bool ResetPWMOvercurrent(void);
 
             virtual PB_ERROR_TYPE ScanWiFi(PB_WIFI_SCAN_RESULT *result);

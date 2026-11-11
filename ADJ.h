@@ -40,7 +40,11 @@ namespace PowerBox
             BuckPort(const GPIOManager& gpio, const MCP3204& mcp, const char* dev, uint8_t address);
             ~BuckPort(void);
 
-            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state);
+            /* keptEn: level of the enable line taken over from an earlier process
+             * (-1 = none, use the boot state). 0: stays off. 1: the converter keeps
+             * running with the voltage its DAC holds (no DAC/EEPROM write); it is
+             * switched off if that value cannot be read or is not plausible. */
+            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state, int keptEn = -1);
 
             bool disable(void) { return this->setState(0, 0.f); }
 
@@ -92,6 +96,8 @@ namespace PowerBox
             bool checkVoltage_(int voltage);
             bool setVoltage_(int target);
             bool parkDac_(void);
+            bool takeOverRunning_(void);
+            static float dacVoltageFor_(int target);
 
             const GPIOManager* gpio_;
             const MCP3204* adc_;
@@ -137,7 +143,11 @@ namespace PowerBox
             PWMPortT(const GPIOManager& gpio, const MCP& mcp, const char* chip = "pwmchip0", int ch = 2);
             ~PWMPortT(void);
 
-            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch = 2, float maxCurrent = 3.0f);
+            /* keptIn: level of the power switch input taken over from an earlier
+             * process (-1 = none). If >= 0 and the PWM channel already runs with
+             * the requested period, the port is kept as it is (see isTakenOver()). */
+            uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch = 2, float maxCurrent = 3.0f, int keptIn = -1);
+            bool isTakenOver(void) const { return this->taken_over_; }
 
             void enable(void) { this->bts_->enable(); }
             void disable(void) { this->bts_->disable(); }
@@ -159,6 +169,7 @@ namespace PowerBox
 
             BTS7XXX_<MCP, kILIS>* bts_;
             PWM* pwm_;
+            bool taken_over_;
     };
 
     /* Backward-compatible alias: the historical MCP3204 / BTS7080 PWM port */

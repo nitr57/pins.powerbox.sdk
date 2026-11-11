@@ -205,12 +205,24 @@ extern "C"
 #define MASK_PORT_OVERCURRENT_RESET     0x40    /* Overcurrent reset */
 #define MASK_PORT_ALL                   0x7F    /* All valid masks combined */
 
+    /* PB_BOOT_STATES (PinsBox): the boot states are applied at the first SDK
+     * start after a Linux boot, and for the ports of the I/O expander also after
+     * it lost its state (e.g. a brownout). Later SDK starts in the same boot (e.g.
+     * NINA restarted) keep the current port states, including dew and PWM duty
+     * and the voltage the buck converter runs with. Dew and PWM ports have no
+     * boot state, they start off. Outputs never pulse at an SDK start.
+     * Over a reboot without power loss the ports of the I/O expander (12 V
+     * ports, dew and PWM enable) keep their state until the first SDK start
+     * applies the boot states. The CM5 lines (USB, buck enable) are reset by the
+     * reboot and held low by the external pull-downs until the first SDK start
+     * (EN_BUCK: to be confirmed against the internal pull-up of GPIO4). */
+
     typedef struct _PB_POWER_PORT_CONFIG
     {
         unsigned int mask;      /* Which fields to update */
         unsigned int index;     /* Which port to update */
         int enabled;            /* Enable/disable each power port */
-        int bootState;          /* Power port state on boot */
+        int bootState;          /* Power port state on boot (PinsBox: see PB_BOOT_STATES) */
         int overcurrentReset;   /* Reset overcurrent flag */
     } PB_POWER_PORT_CONFIG;
 
@@ -219,7 +231,7 @@ extern "C"
         unsigned int mask;          /* Which fields to update */
         unsigned int index;         /* Which port to update */
         int enabled;                /* Enable/disable the USB port */
-        int bootState;              /* USB port state on boot */
+        int bootState;              /* USB port state on boot (PinsBox: see PB_BOOT_STATES) */
         int overcurrentReset;   /* Reset overcurrent flag */
     } PB_USB_PORT_CONFIG;
 
@@ -240,7 +252,8 @@ extern "C"
         unsigned int index;         /* Which port to update */
         float targetVoltage;        /* Target voltage [V]; with MASK_PORT_VOLTAGE 0 = switch off (see PBSetBuckPortConfig) */
         int enabled;                /* Enable/disable the buck converter */
-        int bootState;              /* Buck converter state on boot. PinsBox: set to 0
+        int bootState;              /* Buck converter state on boot (PinsBox: see
+                                       PB_BOOT_STATES). PinsBox: set to 0
                                        automatically if the stored target is invalid at
                                        startup (the target is reset to the minimum and
                                        saved). Stored targets between about 11.85 V and
