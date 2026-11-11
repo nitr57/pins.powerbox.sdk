@@ -28,6 +28,7 @@
 #include "PowerBoxSerialPort.h"
 #include "arduino_base64.hpp"
 #include <cstring>
+#include <cmath>
 #include <condition_variable>
 #include <thread>
 #include <chrono>
@@ -149,6 +150,13 @@ namespace PowerBox
             PB_ERROR("PBOpen: Failed to fetch WiFi info");
             return PB_ERROR_COMMUNICATION;
         }
+
+        // The buck limits only arrive with the first ADJ status line, which the
+        // firmware sends up to one update interval (1-60 s) after :BS#. Until then
+        // report the firmware's own start value (voltMax = 12000 mV), so a client
+        // does not take the 1.0 V default as the maximum. The firmware checks the
+        // real (supply dependent) range itself.
+        this->buckVmax = 12.0f;
 
         // Start telemetry
         if (!this->SendCommand(":BS#"))
@@ -661,10 +669,33 @@ namespace PowerBox
 
     void PowerBoxDevice::ParseAdjMessage(const char *buffer)
     {
-        int adjA[2], Vadc, Vmin, Vmax, Vset;
-        sscanf(buffer, "ADJ:%d:%d:%d:%d:%d:%d:%d:%d:%d#",
-               &adjA[0], &Vset, &Vadc, &Vmin, &Vmax, &this->buckOvercurrent,
-               &adjA[1], &this->pwmPWM, &this->pwmOvercurrent);
+        int adjA[2], Vadc, Vmin, Vmax, Vset, buckOc, pwm, pwmOc;
+        // Only take over lines with all 9 fields: a truncated line would leave
+        // fields uninitialized (e.g. a garbage vmax). The reader splits at '#',
+        // but on a read timeout it also returns a partial line (its rest then
+        // arrives as a separate chunk that is not parsed).
+        if (sscanf(buffer, "ADJ:%d:%d:%d:%d:%d:%d:%d:%d:%d#",
+                   &adjA[0], &Vset, &Vadc, &Vmin, &Vmax, &buckOc,
+                   &adjA[1], &pwm, &pwmOc) != 9)
+        {
+            PB_DEBUG("ParseAdjMessage: incomplete line ignored: %s", buffer);
+            return;
+        }
+        // The firmware sends uint16 values: anything outside is a corrupted line.
+        // An out of range stored target would block a later switch off (it is
+        // sent along and rejected by SetBuckState).
+        const int fields[] = { adjA[0], Vset, Vadc, Vmin, Vmax, buckOc, adjA[1], pwm, pwmOc };
+        for (int v : fields)
+        {
+            if (v < 0 || v > 65535)
+            {
+                PB_DEBUG("ParseAdjMessage: invalid value, line ignored: %s", buffer);
+                return;
+            }
+        }
+        this->buckOvercurrent = buckOc;
+        this->pwmPWM = pwm;
+        this->pwmOvercurrent = pwmOc;
         this->buckCurrent = adjA[0] / 1000.0f;
         this->buckVoltage = Vadc / 1000.0f;
         this->buckVmin = Vmin / 1000.0f;
@@ -1119,9 +1150,22 @@ namespace PowerBox
 
     bool PowerBoxDevice::SetBuckState(int state, float target)
     {
+        // Round, truncating would turn e.g. 7.4 V into 7399 mV
+        long mV = lroundf(target * 1000);
+
+        // The firmware reads the target as 16 bit value: above 65535 mV it would
+        // wrap around (e.g. 70 V -> 4464 mV) and pass its own range check.
+        // PBSetBuckPortConfig already limits to the same value
+        // (PB_BUCK_MAX_TARGET_VOLTAGE), this is the second line of defence.
+        if (mV < 0 || mV > 65535)
+        {
+            PB_ERROR("SetBuckState: target voltage %.3f V out of range", target);
+            return false;
+        }
+
         // Send command
         char cmd[16];
-        snprintf(cmd, sizeof(cmd), ":SAS0%d%d#", state != 0, (int)(target * 1000));
+        snprintf(cmd, sizeof(cmd), ":SAS0%d%ld#", state != 0, mV);
 
         if (!this->SendCommand(cmd))
         {
@@ -1129,7 +1173,8 @@ namespace PowerBox
         }
 
         this->buckState = state != 0;
-        this->buckVset = (int)(target * 1000);
+        // buckVset is in V (see status parsing)
+        this->buckVset = target;
 
         return true;
     }

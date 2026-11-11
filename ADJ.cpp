@@ -24,6 +24,8 @@
 
 #include "ADJ.h"
 #include "common.h"
+#include <algorithm>
+#include <cmath>
 
 namespace PowerBox
 {
@@ -35,9 +37,11 @@ namespace PowerBox
         this->adc_ = &mcp;
 
         this->voltage_adc_ = 0;
-        this->voltage_max_ = VMAX;
+        this->voltage_max_ = VMAX_EFF;
+        this->voltage_target_ = VMIN;
         this->voltage_supply_ = 0;
         this->over_voltage_ = false;
+        this->boot_target_invalid_ = false;
 
         this->dac_ = new MCP4725(dev, address, this->SUPPLY_REF);
         this->bts_ = new BTS7080<MCP3204>(gpio, mcp);
@@ -51,58 +55,213 @@ namespace PowerBox
 
     uint8_t BuckPort::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state)
     {
+        // Drives the enable pin low, the converter is off from here on
         this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port);
         this->bts_->setMaxCurrent(3.0f);
         this->bts_->setChannel(2);
         this->bts_->setSampling(10, 1);
 
-        this->dac_->begin();
-
         this->voltage_supply_ = this->adc_->analogReadAverage(1, 5, 0) * (36e3 + 4.7e3) / 4.7e3;
-        
-        // Set power accordingly
-        this->setState(state, target);
+        this->updateMaxVoltage_();
 
+        // Take the stored target first, so it is kept (and persisted again)
+        // even if the DAC cannot be reached or the supply is too low right now
+        int bootTarget = (target >= 0.f && target <= 100.f) ? (int)lroundf(target * 1000.f) : 0;
+
+        // Older versions accepted targets up to VMAX. Above VMAX_EFF the DAC is
+        // clamped to 0 V, so such a target really produced VMAX_EFF: keep that.
+        if (bootTarget > VMAX_EFF && bootTarget <= VMAX)
+        {
+            PB_INFO("Buck: stored target voltage %.3f V limited to %.3f V", bootTarget * 0.001f, VMAX_EFF * 0.001f);
+            bootTarget = VMAX_EFF;
+        }
+
+        this->boot_target_invalid_ = !this->inRange_(bootTarget);
+        if (!this->boot_target_invalid_)
+        {
+            this->voltage_target_ = bootTarget;
+        }
+        else
+        {
+            // E.g. 0 V stored by an older version, or a rejected target that
+            // was persisted. Never switch on with a voltage nobody asked for.
+            PB_ERROR("Buck: stored target voltage %.2f V is invalid, using %.2f V%s",
+                     target, this->voltage_target_ * 0.001f, state ? ", the buck stays off" : "");
+            this->over_voltage_ = true;
+        }
+
+        if (!this->dac_->begin())
+        {
+            // Without a working DAC the output voltage is unknown, stay off
+            this->bts_->setState(0);
+            return false;
+        }
+
+        // At power-on the DAC loads its EEPROM value. Keep the lowest output
+        // voltage there, so a converter that is enabled before the SDK has
+        // set the DAC never gets a previously used (higher) voltage.
+        // Only writes the EEPROM if it holds a different value.
+        if (!this->dac_->setPowerOnVoltage(SUPPLY_REF))
+        {
+            PB_ERROR("Buck: failed to set DAC power-on value");
+        }
+
+        // Off first: parks the DAC (on a warm restart it still holds the old value)
+        bool ok = this->setState(0, 0.f);
+
+        if (this->boot_target_invalid_)
+        {
+            // setState(0) cleared the flag, the stored target was still rejected
+            this->over_voltage_ = true;
+            return false;
+        }
+
+        if (state)
+        {
+            ok = this->setState(1, this->voltage_target_ * 0.001f);
+        }
+
+        return ok;
+    }
+
+    bool BuckPort::setState(uint8_t state, float targetVoltage)
+    {
+        // Negated check, so NaN is invalid as well
+        bool valid = (targetVoltage >= 0.f && targetVoltage <= 100.f);
+        int target = valid ? (int)lroundf(targetVoltage * 1000.f) : this->voltage_target_;
+
+        // 0 V means off, the last valid target is kept
+        if (valid && target == 0)
+        {
+            state = 0;
+            target = this->voltage_target_;
+        }
+
+        if (!state)
+        {
+            // Off is never blocked, not even by an invalid target.
+            // setState(0) is a no-op if the port is already off, so an over
+            // current flag is kept (disable() would always clear it).
+            // Note: after a failed over current shutdown the port is still on;
+            // if switching it off here succeeds, disable() clears the over
+            // current flag.
+            if (!this->bts_->setState(0))
+            {
+                // Port still on: drop the output to the minimum as emergency
+                // measure, the target is not taken over
+                PB_ERROR("Buck: failed to switch off");
+                this->parkDac_();
+                return false;
+            }
+
+            // Park the DAC at the lowest output voltage, so a later enable
+            // (or a glitch on the enable line) cannot apply an old voltage
+            if (!this->parkDac_())
+            {
+                PB_ERROR("Buck: failed to park DAC");
+            }
+
+            // Remember the target for the next switch on. Only the absolute
+            // range is checked here, the supply limit applies when switching on.
+            if (!valid || !this->inRange_(target))
+            {
+                PB_ERROR("Buck: target voltage %.3f V is out of range (%.2f - %.2f V)", targetVoltage, VMIN * 0.001f, VMAX_EFF * 0.001f);
+                this->over_voltage_ = true;
+                return false;
+            }
+
+            this->voltage_target_ = target;
+            this->over_voltage_ = false;
+            return true;
+        }
+
+        // On: reject the request before touching the hardware
+        if (!valid)
+        {
+            PB_ERROR("Buck: invalid target voltage %f", targetVoltage);
+            this->over_voltage_ = true;
+            return false;
+        }
+
+        if (!this->checkVoltage_(target))
+        {
+            return false;
+        }
+
+        // A failed over current shutdown leaves the port on with the over
+        // current flag set (the listener retries the shutdown). Do not set a
+        // new voltage on it and report success.
+        if (this->bts_->getState() && this->bts_->getOverCurrent())
+        {
+            PB_ERROR("Buck: over current shutdown pending, request rejected");
+            return false;
+        }
+
+        // DAC first, then switch on. If the DAC does not hold the target,
+        // the output voltage would differ from the requested one.
+        // setState(1) is a no-op if the port is already on.
+        if (!this->setVoltage_(target) || !this->bts_->setState(1))
+        {
+            // The output voltage is not the requested one: switch off, even if
+            // the port was on before. Note: if the switch off succeeds and an
+            // over current flag was set, disable() clears it.
+            this->bts_->setState(0);
+            this->parkDac_();
+            return false;
+        }
+
+        this->voltage_target_ = target;
+        this->over_voltage_ = false;
         return true;
     }
-    
-    void BuckPort::setState(uint8_t state, float targetVoltage)
+
+    void BuckPort::setSupplyVoltage(float voltage)
     {
-        this->setVoltage_(targetVoltage * 1000);
-        this->bts_->setState(state);
+        this->voltage_supply_ = voltage * 1000;
+        this->updateMaxVoltage_();
     }
-    
+
+    void BuckPort::measureCurrent(void)
+    {
+        uint8_t wasOn = this->bts_->getState();
+
+        this->bts_->measureCurrent();
+
+        // Over current shutdown: keep "off => DAC parked"
+        if (wasOn && !this->bts_->getState())
+        {
+            this->parkDac_();
+        }
+    }
+
     float BuckPort::getVoltage(void) const
     {
         return this->adc_->analogReadAverage(3, 10, 1) * (SUPPLY_R1 + SUPPLY_R2) / SUPPLY_R2 * 0.001f;
+    }
+
+    void BuckPort::updateMaxVoltage_(void)
+    {
+        // We only support up to 95% of supply voltage
+        // e.g. on 12.0V supply, we can have 11.4V at most
+        this->voltage_max_ = std::min((int)(this->voltage_supply_ * 0.95f), VMAX_EFF);
+    }
+
+    bool BuckPort::inRange_(int voltage) const
+    {
+        return voltage >= VMIN && voltage <= VMAX_EFF;
     }
 
     bool BuckPort::checkVoltage_(int voltage)
     {
         // We need to check whether supply voltage is still able to power
         // the requested output voltage
-        this->voltage_max_ = std::min((int)(this->voltage_supply_ * 0.95f), VMAX);
+        this->updateMaxVoltage_();
 
-        if(voltage > 0)
+        if(voltage > this->voltage_max_ || voltage < VMIN)
         {
-            if(voltage > this->voltage_max_ || voltage < VMIN)
-            {
-                this->bts_->disable();
-                this->dac_->setVoltage(SUPPLY_REF);
+            this->over_voltage_ = true;
 
-                this->voltage_target_ = VMIN;
-                this->over_voltage_ = 1;
-
-                PB_ERROR("Target voltage %d is out of range (%d - %d)", voltage, VMIN, this->voltage_max_);
-
-                return false;
-            }
-        }
-        else if(voltage == 0)
-        {
-            this->bts_->disable();
-            this->dac_->setVoltage(SUPPLY_REF);
-            this->voltage_target_ = VMIN;
+            PB_ERROR("Target voltage %d is out of range (%d - %d)", voltage, VMIN, this->voltage_max_);
 
             return false;
         }
@@ -110,39 +269,21 @@ namespace PowerBox
         return true;
     }
 
-    void BuckPort::setVoltage_(int target)
+    bool BuckPort::setVoltage_(int target)
     {
-        // Check if requested voltage is possible
-        if(!this->checkVoltage_(target))
-        {
-            return;
-        }
+        // Calculate required DAC voltage. ADJ_CAL is a measured calibration
+        // of the output voltage (see ADJ.h).
+        float Vdac = std::min(SUPPLY_REF, ADJ_R2 * std::max(0.f, VMAX - target * ADJ_CAL) / ADJ_R1 * 0.001f);
 
-        // First we need to check what is possible, depending on the supply voltage
-        // as we only support up to 95% of supply voltage
-        // e.g. on 12.0V supply, we can have 11.4V at most
-
-        // Set current power state
-        this->voltage_target_ = target;
-
-        // Calculate required DAC voltage
-        float Vdac = ADJ_R2 * std::max(0.f, VMAX - target * 1.015f) / ADJ_R1 * 0.001f;
-
-        // Set DAC accordingly
-        this->dac_->setVoltage(Vdac);
-
-        // Reset over voltage flag
-        this->over_voltage_ = false;
+        // Set DAC accordingly, verified by reading it back
+        return this->dac_->setVoltage(Vdac);
     }
 
-
-
-
-
-
-
-
-
+    bool BuckPort::parkDac_(void)
+    {
+        // Full scale DAC voltage gives the lowest output voltage
+        return this->dac_->setVoltage(SUPPLY_REF);
+    }
 
     template <typename MCP, uint16_t kILIS>
     PWMPortT<MCP, kILIS>::PWMPortT(const GPIOManager& gpio, const MCP& mcp, const char* chip, int ch)

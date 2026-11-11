@@ -35,19 +35,28 @@ namespace PowerBox
             MCP4725(const char* dev, uint8_t address, float vref);
             ~MCP4725(void);
 
-            uint8_t begin(void);
-            uint8_t isConnected(void);
+            bool begin(void);
 
-            uint8_t setVoltage(float v);
-            float getVoltage(void);
+            /* Writes the DAC register only (no EEPROM wear) and verifies it by
+             * reading it back. Returns false if the DAC does not hold the
+             * requested value afterwards. */
+            bool setVoltage(float v);
+
+            /* Programs the EEPROM, i.e. the value the DAC loads at power-on.
+             * The EEPROM is only written if it holds a different value.
+             * Note: this also sets the DAC output to that value. */
+            bool setPowerOnVoltage(float v);
+
+            /* Voltage the DAC currently outputs, as last read back from it */
+            float getVoltage(void) const;
 
         private:
-            uint8_t setValue_(uint16_t val);
-            uint16_t getValue_(void) { return this->current_val_; }
-            uint16_t readValue_(void);
+            bool toValue_(float v, uint16_t* val) const;
+            bool setValue_(uint16_t val);
 
-            uint8_t writeRegister_(uint16_t val);
-            uint8_t readRegister_(uint8_t* buffer, uint8_t len);
+            bool readState_(uint8_t* status, uint16_t* dac, uint16_t* eeprom, uint8_t* eepromPd);
+            bool waitReady_(void);
+            bool writeRegister_(uint8_t cmd, uint16_t val);
 
             // I2C
             int i2c_fd_;

@@ -34,6 +34,7 @@
 #include "StellaVitaDevice.h"
 #include "ASIAirDevice.h"
 #include <cstring>
+#include <cmath>
 
 using namespace PowerBox;
 
@@ -673,6 +674,11 @@ PBAPI PB_ERROR_TYPE PBGetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config)
     return PB_SUCCESS;
 }
 
+/* Highest valid buck target [V]: the serial PowerBox protocol transfers the
+ * target as uint16 in mV (see PowerBoxDevice::SetBuckState, which checks the
+ * same limit). The PinsBox converter itself stays below about 11.85 V. */
+static const float PB_BUCK_MAX_TARGET_VOLTAGE = 65.535f;
+
 PBAPI PB_ERROR_TYPE PBSetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config)
 {
     PB_DEBUG("PBSetBuckPortConfig: Setting buck port config for device id=%d", id);
@@ -694,17 +700,49 @@ PBAPI PB_ERROR_TYPE PBSetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config)
     auto device = it->second;
 
     // State and power is set with a single call, need to combine
-    int newState = (config->mask & MASK_PORT_ENABLE) ? (config->enabled != 0) : device->GetBuckState();
-    int newTarget = (config->mask & MASK_PORT_VOLTAGE) ? config->targetVoltage : device->GetBuckSetVoltage();
+    int newState = (config->mask & MASK_PORT_ENABLE) ? (config->enabled != 0) : (device->GetBuckState() != 0);
+    float newTarget = (config->mask & MASK_PORT_VOLTAGE) ? config->targetVoltage : device->GetBuckSetVoltage();
+
+    if (config->mask & MASK_PORT_VOLTAGE)
+    {
+        // Negated check, so NaN is invalid as well
+        if (!(newTarget >= 0.0f && newTarget <= PB_BUCK_MAX_TARGET_VOLTAGE))
+        {
+            PB_ERROR("PBSetBuckPortConfig: invalid target voltage %f", newTarget);
+
+            if (newState)
+            {
+                // Switching on with an invalid target: reject, hardware untouched
+                return PB_ERROR_INVALID_PARAMETER;
+            }
+
+            // Switching off is never blocked: switch off with the stored target,
+            // but report that the voltage was not applied
+            if (!device->SetBuckState(0, device->GetBuckSetVoltage()))
+            {
+                PB_ERROR("PBSetBuckPortConfig: Failed to switch off");
+                return PB_ERROR_COMMUNICATION;
+            }
+            return PB_ERROR_INVALID_PARAMETER;
+        }
+
+        // 0 V means off, the stored target is kept (same for all device types).
+        // Same rounding to mV as the devices use, so e.g. 0.0004 V is 0 V too.
+        if (lroundf(newTarget * 1000.0f) == 0)
+        {
+            newState = 0;
+            newTarget = device->GetBuckSetVoltage();
+        }
+    }
 
     if (config->mask & MASK_PORT_ENABLE || config->mask & MASK_PORT_VOLTAGE)
     {
         if (!device->SetBuckState(newState, newTarget))
         {
-            PB_ERROR("PBSetBuckPortConfig: Failed to set buck state, enabled=%d, voltage=%d", newState, newTarget);
+            PB_ERROR("PBSetBuckPortConfig: Failed to set buck state, enabled=%d, voltage=%.2fV", newState, newTarget);
             return PB_ERROR_COMMUNICATION;
         }
-        PB_DEBUG("PBSetBuckPortConfig: state=%d, voltage=%.2fV", newState, newTarget/1000.0f);
+        PB_DEBUG("PBSetBuckPortConfig: state=%d, voltage=%.2fV", newState, newTarget);
     }
 
     if (config->mask & MASK_PORT_BOOT_STATE)

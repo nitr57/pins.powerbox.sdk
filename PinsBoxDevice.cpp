@@ -190,6 +190,27 @@ namespace PowerBox
         this->buck_ = new BuckPort(*this->gpio_, *this->adc_, "/dev/i2c-10", 0x60);
         this->buck_->begin(ADJDEN_PIN, BUCK_PIN, DSEL_PIN, 0, this->buckVset, this->buckBootstrap);
 
+        // Report what the port really uses right away, not only after the
+        // first listener cycle (an invalid stored target may have been replaced)
+        this->buckVset = this->buck_->getTargetVoltage();
+        this->buckState = this->buck_->getState();
+        this->buckVmin = this->buck_->getMinVoltage();
+        this->buckVmax = this->buck_->getMaxVoltage();
+        this->buckOvervoltage = this->buck_->getOverVoltage() ? 1 : 0;
+
+        // An invalid stored target kept the buck off. Make that permanent and
+        // visible (boot state off), otherwise the next boot would switch on
+        // with the replacement target as soon as anything else saves settings.
+        if (this->buck_->getBootTargetInvalid())
+        {
+            if (this->buckBootstrap)
+            {
+                PB_ERROR("Buck: boot state set to off because of the invalid stored target");
+                this->buckBootstrap = 0;
+            }
+            SaveSettings();
+        }
+
         this->pwm_ = new PWMPort(*this->gpio_, *this->adc_);
         this->pwm_->begin(ADJDEN_PIN, PWM_PIN, DSEL_PIN, 1, 30000);
         this->pwm_->setState(0, 0.f);
@@ -962,14 +983,18 @@ namespace PowerBox
 
     bool PinsBoxDevice::SetBuckState(int state, float target)
     {
+        bool ok;
         {
             std::lock_guard<std::mutex> lock(this->hwMutex_);
-            this->buck_->setState(state, target);
+            ok = this->buck_->setState(state != 0, target);
             this->buckState = this->buck_->getState();
-            this->buckVset = target;
+            // Report and persist the target the port really uses, a rejected
+            // target must not be applied again at the next boot
+            this->buckVset = this->buck_->getTargetVoltage();
+            this->buckOvervoltage = this->buck_->getOverVoltage() ? 1 : 0;
         }
         SaveSettings();
-        return true;
+        return ok;
     }
 
     bool PinsBoxDevice::SetBuckBootState(int state)

@@ -238,9 +238,20 @@ extern "C"
     {
         unsigned int mask;          /* Which fields to update */
         unsigned int index;         /* Which port to update */
-        float targetVoltage;        /* Target voltage [V] */
+        float targetVoltage;        /* Target voltage [V]; with MASK_PORT_VOLTAGE 0 = switch off (see PBSetBuckPortConfig) */
         int enabled;                /* Enable/disable the buck converter */
-        int bootState;              /* Buck converter state on boot */
+        int bootState;              /* Buck converter state on boot. PinsBox: set to 0
+                                       automatically if the stored target is invalid at
+                                       startup (the target is reset to the minimum and
+                                       saved). Stored targets between about 11.85 V and
+                                       12.03 V (accepted by older versions) are limited to
+                                       about 11.85 V; that is saved with the next settings
+                                       change. If switching
+                                       on at startup fails for another reason (target
+                                       above the supply dependent maximum, DAC not
+                                       reachable or not settable, switch error), the buck
+                                       stays off (bootState and the target are kept,
+                                       the next boot tries again). */
         int overcurrentReset;   /* Reset overcurrent flag */
     } PB_BUCK_PORT_CONFIG;
 
@@ -305,6 +316,92 @@ extern "C"
     PBAPI PB_ERROR_TYPE PBGetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBSetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config);
+    /* MASK_PORT_ENABLE and MASK_PORT_VOLTAGE are applied in one call
+     * (PinsBox: DAC first, then switch on; serial PowerBox: see below).
+     * Without MASK_PORT_ENABLE the current (reported) on/off state is kept
+     * (except for 0 V, see below). Without MASK_PORT_VOLTAGE the stored target
+     * is used (see PBGetBuckPortConfig).
+     *
+     * All devices:
+     * - With MASK_PORT_VOLTAGE, a valid targetVoltage that rounds to 0 mV
+     *   (0 <= targetVoltage < 0.0005) switches off (enabled is ignored); the
+     *   stored target is used for that request.
+     * - With MASK_PORT_VOLTAGE, a targetVoltage that is NaN, < 0 or
+     *   > 65.535 V (65535 mV, the limit of the serial protocol) is invalid.
+     *   If the port would be on (enabled != 0, or no MASK_PORT_ENABLE and
+     *   currently (reported) on), the request is rejected with
+     *   PB_ERROR_INVALID_PARAMETER without touching the hardware. Otherwise
+     *   the port is switched off anyway (with the stored target), then
+     *   PB_ERROR_INVALID_PARAMETER is returned (PB_ERROR_COMMUNICATION if
+     *   switching off itself failed).
+     * - Devices without buck port (status numPorts 0): no effect. PB_SUCCESS,
+     *   except an invalid targetVoltage (PB_ERROR_INVALID_PARAMETER, see above)
+     *   and MASK_PORT_OVERCURRENT_RESET (PB_ERROR_COMMUNICATION).
+     *
+     * PinsBox:
+     * - The converter is only switched on once the DAC verifiably holds the
+     *   value for the target (the output voltage itself is not measured).
+     * - 0 V keeps the last target.
+     * - Switching off is never blocked by the target. When switching off, a
+     *   new target is stored if it is within the converter's range (status
+     *   vmin .. about 11.85 V, independent of the supply); otherwise it is not
+     *   taken over and an error is returned (the port is off anyway).
+     * - Requests that switch on or keep the port on additionally require the
+     *   target to be within the supply dependent maximum (status vmax);
+     *   rejected targets leave the port as it is. They are also rejected while
+     *   a failed over-current shutdown is pending (status: on and overcurrent);
+     *   in that pending case switching off is still possible and, if it
+     *   succeeds, clears the over-current flag.
+     * - If the DAC cannot be set or the switch does not turn on, the port is
+     *   switched off, even if it was on before. If that switch-off fails too,
+     *   the port stays on; the DAC is parked if reachable (lowest output
+     *   voltage), otherwise the output voltage is undefined.
+     * - If a requested switch-off fails, the port stays on, the DAC is parked
+     *   if reachable (lowest output voltage, about 0.9 V) and the target is not
+     *   taken over.
+     * - MASK_PORT_OVERCURRENT_RESET is not supported (PB_ERROR_COMMUNICATION).
+     *   An over-current flag after a successful shutdown is cleared only by a
+     *   successful switch-on, not by switching off.
+     * - Range errors (a valid target other than 0 V outside vmin .. about
+     *   11.85 V, or above vmax when switching on or keeping the port on) and
+     *   the cases above are currently reported as PB_ERROR_COMMUNICATION;
+     *   invalid values (see All devices) as PB_ERROR_INVALID_PARAMETER.
+     *
+     * Serial PowerBox:
+     * - The command is sent with the target in mV (rounded); the firmware
+     *   checks the range (vmin .. supply dependent vmax). PB_SUCCESS only means
+     *   the command was sent; a rejection by the firmware is not reported.
+     * - On a rejection (also of a switch-off request) the firmware switches
+     *   the port off, even if it was on, parks the DAC (lowest output) and sets
+     *   its target to vmin.
+     * - When switching on, the firmware enables the output before it checks
+     *   the target and sets the DAC: the port briefly runs at the voltage last
+     *   set on the DAC (after a rejection the lowest output), and a rejected
+     *   target then switches it off again.
+     * - After PB_SUCCESS the reported target is the one sent until the
+     *   next ADJ status line replaces it with the firmware's target (vmin after
+     *   a rejection). The reported on/off state stays as requested until it is
+     *   set again, an over-current message arrives or the device is
+     *   reconnected; a request without MASK_PORT_ENABLE uses that reported
+     *   state and can switch the port on again after a rejection.
+     * - "Stored target" is the last one sent or received, whichever is newer
+     *   (1.0 V after PBSearch until the first ADJ status line, which arrives up
+     *   to one update interval (1-60 s) after PBOpen). A request without
+     *   MASK_PORT_VOLTAGE, or with 0 V, sends that stored target to the
+     *   firmware, so before the first ADJ status line it sets the firmware's
+     *   target to 1.0 V, even when switching off.
+     * - After PBOpen, until the first ADJ status line, vmax is reported as
+     *   12.0 V, a placeholder (the firmware's power-on value); the firmware's
+     *   actual limit is 95 % of the measured supply, at most about 12.03 V (so
+     *   below 12.0 V unless the supply is above about 12.6 V).
+     * - After a firmware start the supply is only measured while telemetry is
+     *   streamed. From about 3 s after the firmware start until then (and up to
+     *   about 3 s after the first measurement) the firmware's vmax is 0 and it
+     *   rejects every target, so the first ADJ status line(s) after PBOpen may
+     *   report vmax 0 (up to about one update interval plus 3 s).
+     *
+     * On an error, parts of the mask may already be applied and the remaining
+     * fields are skipped: read the configuration again. */
     PBAPI PB_ERROR_TYPE PBSetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBSetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config);

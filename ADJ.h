@@ -42,13 +42,32 @@ namespace PowerBox
 
             uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, float target, uint8_t state);
 
-            void enable(void) { this->bts_->enable(); }
-            void disable(void) { this->bts_->disable(); }
-            void toggle(void) { this->bts_->toggle(); }
-            void setState(uint8_t state, float targetVoltage);
-            void setSupplyVoltage(float voltage) { this->voltage_supply_ = voltage * 1000; }
+            bool disable(void) { return this->setState(0, 0.f); }
 
-            void measureCurrent(void) { this->bts_->measureCurrent(); }
+            /* Switches the port and sets the target voltage [V] in one step.
+             * - The port is only switched on once the DAC verifiably holds the
+             *   value for the target. A valid target (0..100 V) that rounds to
+             *   0 mV switches off and keeps the last target.
+             * - Switching off is never blocked by the target; an invalid target
+             *   (NaN, outside VMIN..VMAX_EFF) is then not stored and false is
+             *   returned, even though the port is off. If switching off fails,
+             *   the target is not taken over, the DAC is parked if reachable
+             *   (lowest output, about 0.9 V, below VMIN) and false is returned.
+             *   A failed DAC park after a successful switch off is only logged
+             *   (the result depends on the target check alone).
+             * - Requests that switch on or keep the port on: a rejected target
+             *   (NaN, out of range, above the supply limit) leaves the port
+             *   untouched; they are also rejected while a failed over current
+             *   shutdown is pending (port on, over current set). If the DAC
+             *   cannot be set or the switch does not turn on, the port is
+             *   switched off, even if it was on before; if that switch off
+             *   fails too, the port stays on, with the DAC parked if reachable,
+             *   otherwise with an undefined output voltage.
+             * - On success the target is stored and true is returned. */
+            bool setState(uint8_t state, float targetVoltage);
+            void setSupplyVoltage(float voltage);
+
+            void measureCurrent(void);
 
             uint16_t getCurrent_mA(void) const { return this->bts_->getCurrent_mA(); }
             uint8_t getState(void) const { return this->bts_->getState(); }
@@ -57,13 +76,22 @@ namespace PowerBox
             float getMinVoltage(void) const { return this->VMIN * 0.001f; }
             float getMaxVoltage(void) const { return this->voltage_max_ * 0.001f; }
             uint8_t getOverCurrent(void) const { return this->bts_->getOverCurrent(); }
+            /* Set by range/validity rejections (and by begin() for an invalid
+             * stored target), cleared on success. DAC or switch errors, the
+             * pending over current rejection and a failed switch off leave it
+             * unchanged. */
             uint8_t getOverVoltage(void) const { return this->over_voltage_; }
+            /* begin() found an invalid stored target and did not switch on */
+            bool getBootTargetInvalid(void) const { return this->boot_target_invalid_; }
 
             void resetOverCurrent(void) { this->bts_->resetOverCurrent(); }
 
         private:
+            void updateMaxVoltage_(void);
+            bool inRange_(int voltage) const;
             bool checkVoltage_(int voltage);
-            void setVoltage_(int target);
+            bool setVoltage_(int target);
+            bool parkDac_(void);
 
             const GPIOManager* gpio_;
             const MCP3204* adc_;
@@ -78,6 +106,7 @@ namespace PowerBox
             int voltage_target_;
             int voltage_supply_;
             bool over_voltage_;
+            bool boot_target_invalid_;
 
             const BTS7006<MCP3204>* supply_;
 
@@ -89,8 +118,16 @@ namespace PowerBox
             static constexpr float SUPPLY_R2 = 10e3f;
             static constexpr float SUPPLY_REF = 3.3f;
 
+            /* Measured calibration: the DAC value is calculated for a nominal
+             * output of target * ADJ_CAL, which compensates the measured
+             * deviation of the real output voltage */
+            static constexpr float ADJ_CAL = 1.015f;
+
             static constexpr int VMAX = 1e3 * (ADJ_REF + ADJ_REF * (ADJ_R1 / ADJ_R3 + ADJ_R1 / ADJ_R2));
             static constexpr int VMIN = std::max(1000, (int)(VMAX - ADJ_R1 * SUPPLY_REF / ADJ_R2 * 1e3));
+            /* Highest target the output can follow: above it the DAC would be
+             * clamped to 0 V and the output stays at VMAX */
+            static constexpr int VMAX_EFF = (int)(VMAX / ADJ_CAL);
     };
 
     template <typename MCP = MCP3204, uint16_t kILIS = 1800>
