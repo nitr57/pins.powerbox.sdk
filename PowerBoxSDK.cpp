@@ -46,7 +46,17 @@ PBAPI PB_ERROR_TYPE PBScan(int *number, int *ids)
         PB_ERROR("PBScan: Invalid parameters (number or ids is null)");
         return PB_ERROR_NULL_POINTER;
     }
-    *number = ScanPinsBox(ids) ? 1 : 0;
+    int pinsBox = ScanPinsBox(ids);
+    if (pinsBox < 0)
+    {
+        // A PinsBox is present but not usable. Do not scan the other variants:
+        // the error must not look like "no device", and no other variant may
+        // touch the same hardware.
+        *number = 0;
+        PB_ERROR("PBScan: PinsBox present but not usable (see the messages above)");
+        return PB_ERROR_INVALID_STATE;
+    }
+    *number = pinsBox > 0 ? 1 : 0;
     PB_DEBUG("PBScan: Found %d PinsBox device(s)", *number);
     if (*number > 0)
     {

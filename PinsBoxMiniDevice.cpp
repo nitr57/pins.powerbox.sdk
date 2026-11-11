@@ -822,8 +822,16 @@ namespace PowerBox
         }
 
         this->dew_[i]->setState(state, power);
-        this->dewState[i] = state;
-        this->dewPWM[i] = power;
+
+        // Report what the hardware really does
+        this->dewState[i] = this->dew_[i]->getState();
+        this->dewPWM[i] = this->dew_[i]->getDutyCycle();
+
+        if (state != 0 && this->dewState[i] == 0)
+        {
+            PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
         return true;
     }
 
@@ -837,6 +845,11 @@ namespace PowerBox
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dewAuto[i] = state;
             this->dew_[i]->setAutoMode(state);
+            if (state && !this->dew_[i]->isPwmOk())
+            {
+                // No error return: the rest of the dew configuration must still be applied
+                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off", i);
+            }
         }
         SaveSettings();
         return true;
@@ -866,8 +879,16 @@ namespace PowerBox
     {
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
+
+        // Report what the hardware really does (power is not range checked)
         this->pwmState = this->pwm_->getState();
-        this->pwmPWM = power;
+        this->pwmPWM = this->pwm_->getDutyCycle();
+
+        if (state != 0 && this->pwmState == 0)
+        {
+            PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
         return true;
     }
 

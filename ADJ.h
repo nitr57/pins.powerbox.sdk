@@ -148,6 +148,8 @@ namespace PowerBox
              * the requested period, the port is kept as it is (see isTakenOver()). */
             uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch = 2, float maxCurrent = 3.0f, int keptIn = -1);
             bool isTakenOver(void) const { return this->taken_over_; }
+            /* PWM channel set up; without it the switch is never turned on */
+            bool isPwmOk(void) const { return this->pwm_ok_; }
 
             void enable(void) { this->bts_->enable(); }
             void disable(void) { this->bts_->disable(); }
@@ -170,6 +172,7 @@ namespace PowerBox
             BTS7XXX_<MCP, kILIS>* bts_;
             PWM* pwm_;
             bool taken_over_;
+            bool pwm_ok_;
     };
 
     /* Backward-compatible alias: the historical MCP3204 / BTS7080 PWM port */

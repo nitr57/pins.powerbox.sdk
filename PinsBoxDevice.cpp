@@ -40,6 +40,7 @@
 #include <string>
 #include <json/json.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
@@ -150,10 +151,11 @@ namespace PowerBox
 
         std::string data = bootId + "\n";
         int err = 0;
-        bool ok = write(fd, data.c_str(), data.size()) == (ssize_t)data.size();
-        if(!ok)
+        ssize_t written = write(fd, data.c_str(), data.size());
+        bool ok = written == (ssize_t)data.size();
+        if(written < 0)
         {
-            err = errno;
+            err = errno;  // a short write leaves err 0 ("short write")
         }
         fchmod(fd, 0644);
         close(fd);
@@ -171,6 +173,98 @@ namespace PowerBox
         }
     }
 
+    /* Lock file of the PinsBox hardware (world writable tmpfs) */
+    static const char *LOCK_FILE = "/run/lock/pinsbox.lock";
+
+    ProcessLock::~ProcessLock(void)
+    {
+        if(this->fd_ >= 0)
+        {
+            close(this->fd_);
+        }
+    }
+
+    ProcessLock& ProcessLock::operator=(ProcessLock&& other) noexcept
+    {
+        if(this != &other)
+        {
+            if(this->fd_ >= 0)
+            {
+                close(this->fd_);
+            }
+            this->fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    ProcessLock::Result ProcessLock::acquire(const char* path)
+    {
+        // A few attempts only for the case the file is replaced while locking
+        for(int attempt = 0; attempt < 3; ++attempt)
+        {
+            // Read only is enough for flock and avoids protected_regular issues
+            // with a file created by another user. O_NONBLOCK: a FIFO planted in
+            // the world writable directory must not block the scan.
+            const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+            int fd = open(path, flags);
+            if(fd < 0 && errno == ENOENT)
+            {
+                fd = open(path, flags | O_CREAT | O_EXCL, 0644);
+                if(fd >= 0)
+                {
+                    fchmod(fd, 0644);
+                }
+                else if(errno == EEXIST)
+                {
+                    continue;  // created by someone else in the meantime
+                }
+            }
+            if(fd < 0)
+            {
+                PB_ERROR("PinsBox: lock file %s not usable (%s), continuing without process lock", path, strerror(errno));
+                return Unavailable;
+            }
+
+            struct stat st;
+            if(fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+            {
+                close(fd);
+                PB_ERROR("PinsBox: lock file %s is not a regular file, continuing without process lock", path);
+                return Unavailable;
+            }
+
+            if(flock(fd, LOCK_EX | LOCK_NB) != 0)
+            {
+                int err = errno;
+                close(fd);
+                if(err == EWOULDBLOCK)
+                {
+                    return Busy;
+                }
+                PB_ERROR("PinsBox: lock file %s could not be locked (%s), continuing without process lock", path, strerror(err));
+                return Unavailable;
+            }
+
+            // The file may have been removed and recreated while we locked it:
+            // then a lock on the old inode protects nothing, try again
+            struct stat cur;
+            if(stat(path, &cur) == 0 && cur.st_dev == st.st_dev && cur.st_ino == st.st_ino)
+            {
+                if(this->fd_ >= 0)
+                {
+                    close(this->fd_);
+                }
+                this->fd_ = fd;
+                return Acquired;
+            }
+            close(fd);
+        }
+
+        PB_ERROR("PinsBox: lock file %s keeps changing, continuing without process lock", path);
+        return Unavailable;
+    }
+
     PinsBoxDevice::PinsBoxDevice(void)
     {
         this->statusListenerRunning = false;
@@ -179,11 +273,9 @@ namespace PowerBox
         this->dewPoint = DEVICE_DISCONNECTED_C;
         this->extSensor = false;
 
-        // Initial reset
+        // Initial reset (defaults until the settings are loaded after the GPIO
+        // check: a failed setup must not create a settings file)
         this->ResetProperties();
-        
-        // Load settings from file at construction time
-        this->LoadSettings();
 
         this->dht_ = new DHT22("device0");
 
@@ -208,6 +300,17 @@ namespace PowerBox
         // keep an already configured output level, the 1-wire pins idle high,
         // all other lines (sense enables, DSEL) start low.
         const bool gpioOk = this->gpio_->begin(sameBoot, PINS, 19, DS18_PINS, 2);
+        if(!gpioOk)
+        {
+            // GPIO lines busy (another process, an overlay) or not readable, or the
+            // I/O expander not usable: set nothing else up. In particular no DAC,
+            // EEPROM or sysfs PWM access, which would change running outputs.
+            PB_ERROR("PinsBox: GPIO initialization failed, the device is not used and no output is changed");
+            return;
+        }
+
+        // Load settings from file (creates it with defaults if missing)
+        this->LoadSettings();
 
         // Taken over level, or the boot state
         auto initState = [this](uint8_t pin, int bootState) {
@@ -332,10 +435,12 @@ namespace PowerBox
         this->buzzer_->setExport();
 
         // Boot states are written: later starts in this boot take the states over
-        if(gpioOk && !sameBoot && !bootId.empty())
+        if(!sameBoot && !bootId.empty())
         {
             WriteBootMarker(bootId);
         }
+
+        this->initOk_ = true;
     }
 
     PinsBoxDevice::~PinsBoxDevice(void)
@@ -1067,8 +1172,16 @@ namespace PowerBox
         }
 
         this->dew_[i]->setState(state, power);
-        this->dewState[i] = state;
-        this->dewPWM[i] = power;
+
+        // Report what the hardware really does
+        this->dewState[i] = this->dew_[i]->getState();
+        this->dewPWM[i] = this->dew_[i]->getDutyCycle();
+
+        if (state != 0 && this->dewState[i] == 0)
+        {
+            PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
         return true;
     }
 
@@ -1078,6 +1191,11 @@ namespace PowerBox
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dewAuto[i] = state;
             this->dew_[i]->setAutoMode(state);
+            if (state && !this->dew_[i]->isPwmOk())
+            {
+                // No error return: the rest of the dew configuration must still be applied
+                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off", i);
+            }
         }
         SaveSettings();
         return true;
@@ -1136,8 +1254,16 @@ namespace PowerBox
     {
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
+
+        // Report what the hardware really does (power is not range checked)
         this->pwmState = this->pwm_->getState();
-        this->pwmPWM = power;
+        this->pwmPWM = this->pwm_->getDutyCycle();
+
+        if (state != 0 && this->pwmState == 0)
+        {
+            PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
         return true;
     }
 
@@ -1210,23 +1336,41 @@ namespace PowerBox
         return model.find("Compute Module 5") != std::string::npos;
     }
 
-    bool ScanPinsBox(int *ids)
+    int ScanPinsBox(int *ids)
     {
         // Check if this is a Raspberry PI CM5
         std::error_code fsError;
         if(!ids || !IsCM5() || !std::filesystem::exists("/etc/pinsDevice", fsError))
         {
-            return false;
+            return 0;
         }
 
         std::lock_guard<std::mutex> lock(g_globalMutex);
 
         PB_DEBUG("Valid device found!");
 
-        // Check if device already exists, reuse it instead of creating a new one
+        // Check if device already exists, reuse it instead of creating a new one.
+        // The process lock is only taken here: a second flock on a new file
+        // descriptor would fail against our own lock.
         if(g_devices.find(0) == g_devices.end())
         {
+            ProcessLock processLock;
+            if(processLock.acquire(LOCK_FILE) == ProcessLock::Busy)
+            {
+                PB_ERROR("PinsBox: used by another process, not opened here");
+                return -1;
+            }
+
+            // Lock held from reading the boot marker to writing it. Declared
+            // after the lock: if setup fails, the device (GPIO, I/O expander) is
+            // released before the lock.
             auto device = std::make_shared<PinsBoxDevice>();
+            if(!device->IsInitialized())
+            {
+                return -1;
+            }
+
+            device->AdoptLock(std::move(processLock));
             g_devices[0] = device;
 
             // Start status listener thread
@@ -1234,11 +1378,20 @@ namespace PowerBox
         }
         else
         {
+            // Id 0 may hold another device type (e.g. a serial PowerBox registered
+            // by PBScanPort after a failed PinsBox scan). Do not report it as the
+            // PinsBox. g_devices is never cleared, so this lasts until the process
+            // ends (PBScanPort should not use id 0 on a PinsBox - not done yet).
+            if(!std::dynamic_pointer_cast<PinsBoxDevice>(g_devices[0]))
+            {
+                PB_ERROR("PinsBox: id 0 is used by another device, the PinsBox is not opened");
+                return -1;
+            }
             PB_DEBUG("Device at id=0 already exists, reusing it");
         }
         
         ids[0] = 0;
 
-        return true;
+        return 1;
     }
 } /* namespace PowerBox */

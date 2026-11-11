@@ -42,6 +42,26 @@
 
 namespace PowerBox
 {
+    /* Exclusive lock on the PinsBox hardware between processes (flock on a lock
+     * file). Released when the object is destroyed (or the process ends). */
+    class ProcessLock
+    {
+        public:
+            enum Result { Acquired, Busy, Unavailable };
+
+            ProcessLock(void) = default;
+            ~ProcessLock(void);
+            ProcessLock(const ProcessLock&) = delete;
+            ProcessLock& operator=(const ProcessLock&) = delete;
+            ProcessLock(ProcessLock&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+            ProcessLock& operator=(ProcessLock&& other) noexcept;
+
+            Result acquire(const char* path);
+
+        private:
+            int fd_ = -1;
+    };
+
     class PinsBoxDevice : public Device
     {
         public:
@@ -125,6 +145,13 @@ namespace PowerBox
             virtual void StartStatusListener(void);
             virtual void StopStatusListener(void);
 
+            /* False if the GPIO initialization failed: nothing else was set up
+             * and no output was changed, the device must not be used */
+            bool IsInitialized(void) const { return this->initOk_; }
+
+            /* Keeps the process lock for the lifetime of the device */
+            void AdoptLock(ProcessLock&& lock) { this->lock_ = std::move(lock); }
+
         protected:
             virtual void StatusListenerThreadFunc();
             virtual void DHT22ThreadFunc();
@@ -140,20 +167,27 @@ namespace PowerBox
             float temperatureOffset = 0.0f;
             float humidityOffset = 0.0f;
 
-            MCP4725 *mcp4725;
+            MCP4725 *mcp4725 = nullptr;
 
-            DHT22* dht_;
+            // All null until set up, the destructor copes with a constructor
+            // that stopped early
+            DHT22* dht_ = nullptr;
 
-            GPIOManager *gpio_;
-            MCP3204* adc_;
+            GPIOManager *gpio_ = nullptr;
+            MCP3204* adc_ = nullptr;
 
-            BTS7006<MCP3204>* supply_;
-            BTS7012<MCP3204>** pwr_;
-            USB** usb_;
-            DewPort** dew_;
-            BuckPort* buck_;
-            PWMPort* pwm_;
-            PWM* buzzer_;
+            BTS7006<MCP3204>* supply_ = nullptr;
+            BTS7012<MCP3204>** pwr_ = nullptr;
+            USB** usb_ = nullptr;
+            DewPort** dew_ = nullptr;
+            BuckPort* buck_ = nullptr;
+            PWMPort* pwm_ = nullptr;
+            PWM* buzzer_ = nullptr;
+
+            bool initOk_ = false;
+            // Destroyed after the destructor body, i.e. after the GPIO lines and
+            // the I/O expander were released
+            ProcessLock lock_;
             std::thread statusListenerThread_;
             std::thread dht22Thread_;
             std::atomic<bool> dht22ThreadRunning_{false};
@@ -165,11 +199,13 @@ namespace PowerBox
             bool energyUpdateInitialized_ = false;
     };
 
+    /* 1: PinsBox found (ids[0] = 0), 0: no PinsBox, -1: PinsBox present but not
+     * usable (used by another process, or GPIO / I/O expander init failed) */
 #ifdef HAVE_LIBGPIOD
-    bool ScanPinsBox(int *ids);
+    int ScanPinsBox(int *ids);
 #else
     /* Stub when libgpiod / PinsBox support is not available */
-    inline bool ScanPinsBox(int *ids) { (void)ids; return false; }
+    inline int ScanPinsBox(int *ids) { (void)ids; return 0; }
 #endif
 
 } /* namespace PowerBox */

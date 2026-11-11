@@ -209,13 +209,15 @@ extern "C"
      * start after a Linux boot, and for the ports of the I/O expander also after
      * it lost its state (e.g. a brownout). Later SDK starts in the same boot (e.g.
      * NINA restarted) keep the current port states, including dew and PWM duty
-     * and the voltage the buck converter runs with. Dew and PWM ports have no
+     * and the voltage the buck converter runs with (if the running configuration
+     * is plausible, otherwise the port starts off). Dew and PWM ports have no
      * boot state, they start off. Outputs never pulse at an SDK start.
      * Over a reboot without power loss the ports of the I/O expander (12 V
      * ports, dew and PWM enable) keep their state until the first SDK start
      * applies the boot states. The CM5 lines (USB, buck enable) are reset by the
-     * reboot and held low by the external pull-downs until the first SDK start
-     * (EN_BUCK: to be confirmed against the internal pull-up of GPIO4). */
+     * reboot and held low by the external pull-downs (EN_BUCK is GPIO4, whose
+     * internal pull-up is on by default: the external pull-down has to override
+     * it, not yet verified on hardware) until the first SDK start. */
 
     typedef struct _PB_POWER_PORT_CONFIG
     {
@@ -256,15 +258,17 @@ extern "C"
                                        PB_BOOT_STATES). PinsBox: set to 0
                                        automatically if the stored target is invalid at
                                        startup (the target is reset to the minimum and
-                                       saved). Stored targets between about 11.85 V and
-                                       12.03 V (accepted by older versions) are limited to
-                                       about 11.85 V; that is saved with the next settings
-                                       change. If switching
-                                       on at startup fails for another reason (target
-                                       above the supply dependent maximum, DAC not
-                                       reachable or not settable, switch error), the buck
-                                       stays off (bootState and the target are kept,
-                                       the next boot tries again). */
+                                       saved), but not when a running converter is taken
+                                       over: then the voltage it runs with becomes the
+                                       target and is saved, bootState is kept. Stored
+                                       targets between about 11.85 V and 12.03 V
+                                       (accepted by older versions) are limited to about
+                                       11.85 V and saved at startup. If switching on at
+                                       startup fails for another reason (target above the
+                                       supply dependent maximum, DAC not reachable or not
+                                       settable, switch error), the buck stays off
+                                       (bootState and the target are kept, the next boot
+                                       tries again). */
         int overcurrentReset;   /* Reset overcurrent flag */
     } PB_BUCK_PORT_CONFIG;
 
@@ -295,6 +299,10 @@ extern "C"
     } PB_WIFI_CONFIG;
 
     /* Device scanning and management */
+    /* Returns PB_ERROR_INVALID_STATE with *number = 0 if a PinsBox is present but
+     * not usable (e.g. used by another process, its GPIO / I/O expander could not
+     * be initialized, or id 0 is used by another device; the reason is in the SDK
+     * log). No other device type is scanned then. */
     PBAPI PB_ERROR_TYPE PBScan(int *number, int *ids);
 #ifdef __unix__
     /* Probes only the given port (as returned by PBGetPort, or a device node

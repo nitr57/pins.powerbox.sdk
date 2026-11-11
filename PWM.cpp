@@ -121,5 +121,8 @@ bool PWM::write_(const std::string& path, const std::string& val)
 
     ofs << val;
 
-    return true;
+    // sysfs reports rejected values (EINVAL, EBUSY) from write(2), which the
+    // stream only issues when it is flushed: close explicitly and check
+    ofs.close();
+    return !ofs.fail();
 }

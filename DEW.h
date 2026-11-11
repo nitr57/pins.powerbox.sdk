@@ -60,6 +60,8 @@ namespace PowerBox
             uint8_t getAutoMode(void) const { return this->auto_mode_; }
             uint8_t getDutyCycle(void) const;
             uint8_t getOverCurrent(void) const { return this->bts_->getOverCurrent(); }
+            /* PWM channel set up; without it the heater is never switched on */
+            bool isPwmOk(void) const { return this->pwm_ok_; }
             float getTemperature(void) const { return this->probe_->getTemperature(); }
 
             void resetOverCurrent(void) { this->bts_->resetOverCurrent(); }
@@ -75,6 +77,10 @@ namespace PowerBox
             PWM* pwm_;
 
             bool auto_mode_;
+
+            /* PWM channel set up (taken over or initialized); without it the
+             * heater switch is never turned on */
+            bool pwm_ok_;
 
             /* A heater taken over in auto mode keeps its output until probe and
              * dew point are valid for the first time (at most SENSOR_GRACE_PERIOD) */

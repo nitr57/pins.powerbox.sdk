@@ -375,6 +375,7 @@ namespace PowerBox
         this->bts_ = new BTS7XXX_<MCP, kILIS>(gpio, mcp);
         this->pwm_ = new PWM(chip, ch);
         this->taken_over_ = false;
+        this->pwm_ok_ = false;
     }
 
     template <typename MCP, uint16_t kILIS>
@@ -391,6 +392,7 @@ namespace PowerBox
         // expected, otherwise the duty cycle read back would be meaningless
         unsigned int period = (unsigned int)(1e9 / freq);
         this->taken_over_ = false;
+        this->pwm_ok_ = false;
         if(keptIn >= 0 && this->pwm_->setExport())
         {
             this->taken_over_ = this->pwm_->getPeriod() == period;
@@ -407,23 +409,35 @@ namespace PowerBox
 
         if(this->taken_over_)
         {
+            this->pwm_ok_ = true;
             return true;
         }
 
         RETURN_IF_ERROR(this->pwm_->setExport());
-        // Duty first (best effort): a duty above the new period would be rejected.
-        // Right after an export the period may still be 0, then this write fails.
+        // Best effort first (the switch is already off): disable a channel that may
+        // still run, and duty 0, because a duty above the new period would be
+        // rejected. Right after an export the period may still be 0, then these
+        // writes fail.
+        this->pwm_->setState(0);
         this->pwm_->setDutyCycle(0);
         RETURN_IF_ERROR(this->pwm_->setPeriod(period));
         RETURN_IF_ERROR(this->pwm_->setDutyCycle(0));
         RETURN_IF_ERROR(this->pwm_->setState(0));
 
+        this->pwm_ok_ = true;
         return true;
     }
 
     template <typename MCP, uint16_t kILIS>
     void PWMPortT<MCP, kILIS>::setState(uint8_t state, uint8_t dc)
     {
+        // Without a working PWM the switch must not be turned on
+        if(!this->pwm_ok_)
+        {
+            this->bts_->setState(0);
+            return;
+        }
+
         // Convert duty cycle to nano seconds
         unsigned int period = this->pwm_->getPeriod();
         unsigned int dutyCycle = (unsigned int)(((uint64_t)period * dc) / 255);
@@ -445,6 +459,12 @@ namespace PowerBox
     template <typename MCP, uint16_t kILIS>
     uint8_t PWMPortT<MCP, kILIS>::getDutyCycle(void) const
     {
+        // A channel that is not set up says nothing about the port
+        if(!this->pwm_ok_)
+        {
+            return 0;
+        }
+
         unsigned int period = this->pwm_->getPeriod();
         unsigned int dutyCycle_ns = this->pwm_->getDutyCycle();
 
