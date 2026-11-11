@@ -111,6 +111,11 @@ namespace PowerBox
             virtual int GetPWMPower(void) = 0;
             virtual bool ResetPWMOvercurrent(void) = 0;
 
+            /* PWM resolution in bits (the power of a dew/PWM port is 0 to 2^bits - 1);
+             * 0 = no such port or not known yet */
+            int GetDewPwmResolution(void) const { return this->dewPwmResolution; }
+            int GetPWMPwmResolution(void) const { return this->pwmPwmResolution; }
+
             PB_ERROR_TYPE GetPowerPortStatus(PB_POWER_PORT_STATUS *status) const;
             PB_ERROR_TYPE GetUSBPortStatus(PB_USB_PORT_STATUS *status) const;
             PB_ERROR_TYPE GetDewPortStatus(PB_DEW_PORT_STATUS *status) const;

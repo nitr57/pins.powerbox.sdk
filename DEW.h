@@ -93,10 +93,37 @@ namespace PowerBox
             int fast_retries_;
             std::chrono::steady_clock::time_point next_retry_;
 
-            /* A heater taken over in auto mode keeps its output until probe and
-             * dew point are valid for the first time (at most SENSOR_GRACE_PERIOD) */
-            bool hold_;
-            std::chrono::steady_clock::time_point hold_until_;
+            uint8_t outputDuty_(void) const;
+            void checkRunaway_(int dutyCycle, float temperature, std::chrono::steady_clock::time_point now);
+
+            /* Auto mode without a valid probe temperature or dew point keeps the
+             * average duty of the last DUTY_AVERAGE_TIME (exponential average of
+             * the regulated duty; starts from the output when the port is set up
+             * or auto mode is switched on) until the data is valid again. The
+             * port is not switched off: no data is not a reason to let the
+             * optics fog up. Logged as info during START_WINDOW after begin()
+             * (sensors not read yet) or with a duty of 0, as error otherwise. */
+            static constexpr std::chrono::seconds DUTY_AVERAGE_TIME{300};
+            static constexpr std::chrono::seconds START_WINDOW = SENSOR_GRACE_PERIOD;
+            float avg_duty_;
+            std::chrono::steady_clock::time_point avg_time_;
+            bool holding_;
+            bool hold_error_logged_;
+            std::chrono::steady_clock::time_point start_window_end_;
+
+            /* Runaway warning (no limit): heater switched on with a regulated
+             * duty >= RUNAWAY_DUTY, and the probe gets less than RUNAWAY_RISE_K
+             * warmer within RUNAWAY_TIME (checked in successive periods): the
+             * probe is not heated by the heater (detached) or the heater is too
+             * weak. Logged once; logged again only after a period with a rise or
+             * after the full power phase ended. */
+            static constexpr int RUNAWAY_DUTY = 250;
+            static constexpr std::chrono::minutes RUNAWAY_TIME{15};
+            static constexpr float RUNAWAY_RISE_K = 1.f;
+            bool runaway_running_;
+            bool runaway_warned_;
+            std::chrono::steady_clock::time_point runaway_start_;
+            float runaway_temperature_;
     };
 
     /* Backward-compatible alias: the historical MCP3204-based dew port */

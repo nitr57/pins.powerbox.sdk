@@ -570,6 +570,17 @@ PBAPI PB_ERROR_TYPE PBGetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config)
     return PB_SUCCESS;
 }
 
+/* Highest power value of a dew/PWM port with the given PWM resolution [bits],
+ * -1 if the resolution is not valid (port not present or not known yet) */
+static int PBMaxPower(int resolution)
+{
+    if (resolution < 1 || resolution > 16)
+    {
+        return -1;
+    }
+    return (1 << resolution) - 1;
+}
+
 PBAPI PB_ERROR_TYPE PBSetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config)
 {
     PB_DEBUG("PBSetDewPortConfig: Setting dew port config for device id=%d", id);
@@ -602,6 +613,46 @@ PBAPI PB_ERROR_TYPE PBSetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config)
     int newPower = (config->mask & MASK_PORT_POWER) ? config->power : device->GetDewPWMPower(idx);
     bool autoMode = false;
 
+    // Check all values before anything is applied. The power is only used to
+    // switch on (switching off sets 0), so an invalid power never blocks
+    // switching off. Out of range values would otherwise wrap around in the
+    // device (e.g. -1 -> full power).
+    if ((config->mask & MASK_PORT_POWER) && newState != 0)
+    {
+        int maxPower = PBMaxPower(device->GetDewPwmResolution());
+        if (config->power < 0 || config->power > maxPower)
+        {
+            PB_ERROR("PBSetDewPortConfig: Power %d out of range [0, %d] on port %d", config->power, maxPower, idx);
+            return PB_ERROR_INVALID_PARAMETER;
+        }
+    }
+
+    // Negated check, so NaN is invalid as well
+    if ((config->mask & MASK_PORT_AUTO_DEW_THRESHOLD) &&
+        !(config->autoThreshold >= 0.0f && config->autoThreshold <= 25.5f))
+    {
+        PB_ERROR("PBSetDewPortConfig: Auto threshold %.2f out of range [0, 25.5]", config->autoThreshold);
+
+        // Switching off is never blocked (like the buck port): a request that
+        // switches the port off manually is still applied (auto mode off first,
+        // if requested), the rest is not
+        bool autoAfter = (config->mask & MASK_PORT_AUTO_DEW_MODE) ? (config->autoMode != 0) : (device->GetDewAutoMode(idx) != 0);
+        if ((config->mask & MASK_PORT_ENABLE) && config->enabled == 0 && !autoAfter)
+        {
+            if ((config->mask & MASK_PORT_AUTO_DEW_MODE) && !device->SetDewAutoMode(idx, 0))
+            {
+                PB_ERROR("PBSetDewPortConfig: Failed to set auto mode on port %d", idx);
+                return PB_ERROR_COMMUNICATION;
+            }
+            if (!device->SetDewState(idx, 0, 0))
+            {
+                PB_ERROR("PBSetDewPortConfig: Failed to switch off port %d", idx);
+                return PB_ERROR_COMMUNICATION;
+            }
+        }
+        return PB_ERROR_INVALID_PARAMETER;
+    }
+
     if (config->mask & MASK_PORT_AUTO_DEW_MODE)
     {
         if (!device->SetDewAutoMode(config->index, config->autoMode))
@@ -628,12 +679,6 @@ PBAPI PB_ERROR_TYPE PBSetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config)
 
     if (config->mask & MASK_PORT_AUTO_DEW_THRESHOLD)
     {
-        if (config->autoThreshold < 0.0f || config->autoThreshold > 25.5f)
-        {
-            PB_ERROR("PBSetDewPortConfig: Auto threshold %.2f out of range [0, 25.5]", config->autoThreshold);
-            return PB_ERROR_INVALID_PARAMETER;
-        }
-
         if (!device->SetDewAutoThreshold(config->index, config->autoThreshold))
         {
             PB_ERROR("PBSetDewPortConfig: Failed to set auto threshold on port %d", config->index);
@@ -828,6 +873,23 @@ PBAPI PB_ERROR_TYPE PBSetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config)
     // State and power is set with a single call, need to combine
     int newState = (config->mask & MASK_PORT_ENABLE) ? (config->enabled != 0) : device->GetPWMState();
     int newPower = (config->mask & MASK_PORT_POWER) ? config->power : device->GetPWMPower();
+
+    // Checked before anything is applied; only used to switch on (see PBSetDewPortConfig)
+    if ((config->mask & MASK_PORT_POWER) && newState != 0)
+    {
+        if (device->GetNumPWMPorts() < 1)
+        {
+            PB_ERROR("PBSetPWMPortConfig: device has no PWM port");
+            return PB_ERROR_INVALID_PARAMETER;
+        }
+
+        int maxPower = PBMaxPower(device->GetPWMPwmResolution());
+        if (config->power < 0 || config->power > maxPower)
+        {
+            PB_ERROR("PBSetPWMPortConfig: Power %d out of range [0, %d]", config->power, maxPower);
+            return PB_ERROR_INVALID_PARAMETER;
+        }
+    }
 
     if (config->mask & MASK_PORT_ENABLE || config->mask & MASK_PORT_POWER)
     {

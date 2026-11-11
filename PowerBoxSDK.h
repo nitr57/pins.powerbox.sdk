@@ -143,11 +143,11 @@ extern "C"
     typedef struct _PB_DEW_PORT_STATUS
     {
         int numPorts;                               /* Number of ports */
-        int pwmResolution;                          /* PWM resolution (bit depth) */
+        int pwmResolution;                          /* PWM resolution (bit depth); 0 = no dew port */
         float current[PB_MAX_DEW_PORTS];            /* Current draw [A] */
         int overcurrent[PB_MAX_DEW_PORTS];          /* Overcurrent flag */
-        float probe[PB_MAX_DEW_PORTS];              /* Probe temperature [°C] */
-        int pwm[PB_MAX_DEW_PORTS];                  /* PWM value [%] */
+        float probe[PB_MAX_DEW_PORTS];              /* Probe temperature [°C], -127 = no valid value */
+        int pwm[PB_MAX_DEW_PORTS];                  /* PWM value, raw (0 to 2^pwmResolution-1), not [%] */
         int state[PB_MAX_DEW_PORTS];                /* Port state (ON/OFF) */
     } PB_DEW_PORT_STATUS;
 
@@ -166,10 +166,10 @@ extern "C"
     typedef struct _PB_PWM_PORT_STATUS
     {
         int numPorts;                                /* Number of ports */
-        int pwmResolution;                           /* PWM resolution (bit depth) */
+        int pwmResolution;                           /* PWM resolution (bit depth); 0 = no PWM port */
         float current;                               /* Current draw [A] */
         int overcurrent;                             /* Overcurrent flag */
-        int pwm;                                     /* PWM value [%] */
+        int pwm;                                     /* PWM value, raw (0 to 2^pwmResolution-1), not [%] */
         int state;                                   /* Port state (ON/OFF), also reflects over current shutdowns */
     } PB_PWM_PORT_STATUS;
 
@@ -351,6 +351,42 @@ extern "C"
      * if auto mode is not switched on in the same call), threshold, over-current
      * reset. On an error, the fields before are applied and the remaining ones
      * are skipped: read the configuration again.
+     * Checked before anything is applied (PB_ERROR_INVALID_PARAMETER): power
+     * outside 0 to 2^pwmResolution-1 of the device (PinsBox / PinsBox Mini 255,
+     * serial PowerBox 63) whenever MASK_PORT_POWER is set and the port is
+     * switched on or stays on (also if auto mode, switched on in the same call
+     * or already on, does not use it); switching off ignores the power (it sets
+     * 0), so it is never blocked. Threshold outside 0 to 25.5 or NaN; if the
+     * call also switches the port off manually (MASK_PORT_ENABLE with enabled
+     * 0, auto mode off after the call), the switch off (and auto mode off, if
+     * requested) is still applied, the rest is not; PB_ERROR_COMMUNICATION
+     * instead if that auto mode off or switch off fails (auto mode may be off
+     * already).
+     * PinsBox / PinsBox Mini: auto mode on/off is bumpless. Switching auto mode
+     * off keeps the duty the regulation had last (read the configuration again
+     * for it). Switching it on keeps the current output as the hold value (see
+     * below); with valid data the regulation sets its own duty within about
+     * 1 s.
+     * PinsBox / PinsBox Mini auto mode: without a valid probe temperature or
+     * dew point (after a grace period of 60 s for read errors) the port keeps
+     * its average duty of the last minutes (5 min time constant; after a start
+     * or after switching auto mode on: the output it had), it is not switched
+     * off, until the data is valid again. This can be up to full power, for an
+     * unlimited time. Logged as error (info during the first 60 s after the
+     * start, and with a duty of 0). If the heater runs at full power
+     * (switched on, duty >= 250) and the probe gets less than 1 K warmer
+     * within 15 min (checked in successive 15 min periods), an error is logged
+     * once (probe not attached to the heater, or heater too weak); the power is
+     * not limited. Logged again only after a period with a rise of 1 K or
+     * more, or after full power ended. A detached probe is only noticed this
+     * way if it reads close to the dew point (full power); in drier air the
+     * heater runs on with the partial duty computed from the detached probe,
+     * without a warning. Probe values are checked for plausibility
+     * (configuration register, range, the power-on value 85 C, jumps of more
+     * than 10 K need 3 matching reads, the first value after a start or after
+     * 60 s without valid values needs 2).
+     * Only DS18B20 probes (and compatible clones) are supported; a DS18S20
+     * never gives a valid value (auto mode then keeps its duty, see above).
      * PinsBox / PinsBox Mini: PB_ERROR_COMMUNICATION if the port could not be
      * switched on (e.g. its PWM is not set up) or off, if enable/power is set
      * while the port is in auto mode, and for MASK_PORT_OVERCURRENT_RESET (not
@@ -447,7 +483,12 @@ extern "C"
     PBAPI PB_ERROR_TYPE PBGetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config);
     /* Enable and power are applied in one step; switching off also sets the
      * power to 0. Power alone while the port is off is not applied (the port
-     * stays off, PB_SUCCESS).
+     * stays off, PB_SUCCESS). Power outside 0 to 2^pwmResolution-1 of the
+     * device (PinsBox / PinsBox Mini 255, serial PowerBox 1023) is rejected
+     * with PB_ERROR_INVALID_PARAMETER before anything is applied, if it is used
+     * (port switched on or staying on); switching off is never blocked. On a
+     * device without a PWM port, power with the port on is
+     * PB_ERROR_INVALID_PARAMETER as well.
      * PinsBox / PinsBox Mini: enabled with power 0 is "on" with no output (the
      * PWM channel runs only with a power above 0), so a later power change takes
      * effect. PB_ERROR_COMMUNICATION if the port could not be switched on (e.g.
