@@ -36,6 +36,9 @@ namespace PowerBox
         this->auto_mode_ = false;
         this->hold_ = false;
         this->pwm_ok_ = false;
+        this->period_ = 0;
+        this->port_ = 0;
+        this->fast_retries_ = 0;
 
         this->probe_ = new DS18B20(gpio);
         this->bts_ = new BTS7080<MCP>(gpio, mcp);
@@ -62,7 +65,7 @@ namespace PowerBox
     }
 
     template <typename MCP>
-    uint8_t DewPortT<MCP>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch, int keptIn)
+    uint8_t DewPortT<MCP>::begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch, int keptIn, int index)
     {
         this->probe_->begin(probe_pin);
 
@@ -71,12 +74,16 @@ namespace PowerBox
         unsigned int period = (unsigned int)(1e9 / freq);
         bool keep = false;
         this->pwm_ok_ = false;
-        if(keptIn >= 0 && this->pwm_->setExport())
+        this->period_ = period;
+        // Log with the API index (the DSEL port differs from it on the PinsBox)
+        this->port_ = index >= 0 ? (uint8_t)index : port;
+        // A channel that is not exported cannot be taken over (and must not wait here)
+        if(keptIn >= 0 && this->pwm_->exists() && this->pwm_->setExport())
         {
             keep = this->pwm_->getPeriod() == period;
             if(!keep)
             {
-                PB_INFO("Dew port %u: PWM not configured as expected, initialized off", port);
+                PB_INFO("Dew port %u: PWM not configured as expected, initialized off", this->port_);
             }
         }
 
@@ -96,22 +103,74 @@ namespace PowerBox
             return true;
         }
 
-        RETURN_IF_ERROR(this->pwm_->setExport());
+        this->pwm_ok_ = this->initPwm_(true);
+
+        // Auto mode also without a working PWM: the pwm_ok_ guard keeps the switch
+        // off, and auto mode then retries the PWM setup
+        this->auto_mode_ = mode;
+
+        if(!this->pwm_ok_)
+        {
+            PB_ERROR("Dew port %u: PWM could not be set up, the heater stays off (retried by auto mode or the next switch request: every second for a while if the channel is exported, else at most every 30 s)", this->port_);
+            // Exported but not writable yet (udev slow at boot): retry soon
+            this->fast_retries_ = 0;
+            this->next_retry_ = std::chrono::steady_clock::now() +
+                (this->pwm_->exists() ? std::chrono::seconds(1) : std::chrono::seconds(30));
+        }
+
+        return this->pwm_ok_;
+    }
+
+    template <typename MCP>
+    bool DewPortT<MCP>::initPwm_(bool wait)
+    {
+        if(!this->pwm_->setExport(wait))
+        {
+            return false;
+        }
+
         // Best effort first (the switch is already off): disable a channel that may
         // still run, and duty 0, because a duty above the new period would be
         // rejected. Right after an export the period may still be 0, then these
         // writes fail.
         this->pwm_->setState(0);
         this->pwm_->setDutyCycle(0);
-        RETURN_IF_ERROR(this->pwm_->setPeriod(period));
-        RETURN_IF_ERROR(this->pwm_->setDutyCycle(0));
-        RETURN_IF_ERROR(this->pwm_->setState(0));
 
-        // Auto mode only with a working PWM, it would otherwise switch the heater
-        // on with an unknown PWM state
+        return this->pwm_->setPeriod(this->period_) &&
+               this->pwm_->setDutyCycle(0) &&
+               this->pwm_->setState(0);
+    }
+
+    template <typename MCP>
+    bool DewPortT<MCP>::retryPwm_(void)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if(now < this->next_retry_)
+        {
+            return false;
+        }
+        this->next_retry_ = now + std::chrono::seconds(30);
+
+        // Only with the switch off (it could not be switched off otherwise)
+        if(this->bts_->getState() != 0)
+        {
+            return false;
+        }
+
+        if(!this->initPwm_(false))
+        {
+            // Exported, but udev has not made it writable yet: try again soon,
+            // a limited number of times (a failed try logs no error)
+            if(this->pwm_->exists() && this->fast_retries_ < FAST_RETRIES)
+            {
+                ++this->fast_retries_;
+                this->next_retry_ = now + std::chrono::seconds(1);
+            }
+            return false;
+        }
+
+        PB_INFO("Dew port %u: PWM set up after a retry", this->port_);
         this->pwm_ok_ = true;
-        this->auto_mode_ = mode;
-
         return true;
     }
 
@@ -220,11 +279,15 @@ namespace PowerBox
     void DewPortT<MCP>::setState_(uint8_t state, uint8_t dutyCycle)
     {
         // Without a working PWM the heater must not be switched on, neither by
-        // auto mode (also when switched on later by the user) nor manually
+        // auto mode (also when switched on later by the user) nor manually.
+        // The PWM setup is retried now and then, with the switch off.
         if(!this->pwm_ok_)
         {
             this->bts_->setState(0);
-            return;
+            if(!this->retryPwm_())
+            {
+                return;
+            }
         }
 
         // Convert duty cycle to nano seconds

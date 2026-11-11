@@ -832,6 +832,12 @@ namespace PowerBox
             PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
             return false;
         }
+        if (state == 0 && this->dewState[i] != 0)
+        {
+            // The heater keeps running: the caller must know
+            PB_ERROR("Dew port %d: could not be switched off", i);
+            return false;
+        }
         return true;
     }
 
@@ -848,7 +854,7 @@ namespace PowerBox
             if (state && !this->dew_[i]->isPwmOk())
             {
                 // No error return: the rest of the dew configuration must still be applied
-                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off", i);
+                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off until a retry of the PWM setup succeeds", i);
             }
         }
         SaveSettings();
@@ -887,6 +893,12 @@ namespace PowerBox
         if (state != 0 && this->pwmState == 0)
         {
             PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state == 0 && this->pwmState != 0)
+        {
+            // The port keeps running: the caller must know
+            PB_ERROR("PWM port: could not be switched off");
             return false;
         }
         return true;

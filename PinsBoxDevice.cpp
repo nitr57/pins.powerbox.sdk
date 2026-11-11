@@ -305,7 +305,7 @@ namespace PowerBox
             // GPIO lines busy (another process, an overlay) or not readable, or the
             // I/O expander not usable: set nothing else up. In particular no DAC,
             // EEPROM or sysfs PWM access, which would change running outputs.
-            PB_ERROR("PinsBox: GPIO initialization failed, the device is not used and no output is changed");
+            PB_ERROR("PinsBox: GPIO initialization failed, the device is not used and no port output is switched");
             return;
         }
 
@@ -383,8 +383,8 @@ namespace PowerBox
 
         // Initialize Dew ports
         // Dew ports have no boot state: off at the first start, taken over later
-        this->dew_[0]->begin(DEWDEN_PIN, DEW_PINS[1], DSEL_PIN, DS18_PINS[0], 1, 400, this->dewAuto[0], 2, this->gpio_->keptValue(DEW_PINS[1]));
-        this->dew_[1]->begin(DEWDEN_PIN, DEW_PINS[0], DSEL_PIN, DS18_PINS[1], 0, 400, this->dewAuto[1], 2, this->gpio_->keptValue(DEW_PINS[0]));
+        this->dew_[0]->begin(DEWDEN_PIN, DEW_PINS[1], DSEL_PIN, DS18_PINS[0], 1, 400, this->dewAuto[0], 2, this->gpio_->keptValue(DEW_PINS[1]), 0);
+        this->dew_[1]->begin(DEWDEN_PIN, DEW_PINS[0], DSEL_PIN, DS18_PINS[1], 0, 400, this->dewAuto[1], 2, this->gpio_->keptValue(DEW_PINS[0]), 1);
 
         // Initialize adjustable ports
         this->buck_ = new BuckPort(*this->gpio_, *this->adc_, "/dev/i2c-10", 0x60);
@@ -1182,6 +1182,12 @@ namespace PowerBox
             PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
             return false;
         }
+        if (state == 0 && this->dewState[i] != 0)
+        {
+            // The heater keeps running: the caller must know
+            PB_ERROR("Dew port %d: could not be switched off", i);
+            return false;
+        }
         return true;
     }
 
@@ -1194,7 +1200,7 @@ namespace PowerBox
             if (state && !this->dew_[i]->isPwmOk())
             {
                 // No error return: the rest of the dew configuration must still be applied
-                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off", i);
+                PB_ERROR("Dew port %d: auto mode set, but the PWM is not initialized, the heater stays off until a retry of the PWM setup succeeds", i);
             }
         }
         SaveSettings();
@@ -1262,6 +1268,12 @@ namespace PowerBox
         if (state != 0 && this->pwmState == 0)
         {
             PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state == 0 && this->pwmState != 0)
+        {
+            // The port keeps running: the caller must know
+            PB_ERROR("PWM port: could not be switched off");
             return false;
         }
         return true;

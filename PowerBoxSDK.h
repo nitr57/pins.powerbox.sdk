@@ -219,6 +219,17 @@ extern "C"
      * internal pull-up is on by default: the external pull-down has to override
      * it, not yet verified on hardware) until the first SDK start. */
 
+    /* PB_EXIT (PinsBox): dew regulation, software over-current protection and
+     * the status listener run in the process that loaded the SDK, from the first
+     * PBScan on and independent of PBOpen/PBClose. The SDK changes no output when
+     * the process ends (normal exit, SIGTERM, SIGKILL, crash): ports, USB and the
+     * buck keep their state (CM5 lines: pinctrl-rp1 keeps released outputs by
+     * default, not yet verified on hardware), dew heaters and the PWM port keep
+     * their last duty - unregulated (a dew heater in auto mode stays at its last
+     * duty, up to 100 %) and without software over-current protection (only the
+     * switches' own protection). The next SDK start in the same Linux boot
+     * takes the states over (see PB_BOOT_STATES). */
+
     typedef struct _PB_POWER_PORT_CONFIG
     {
         unsigned int mask;      /* Which fields to update */
@@ -302,7 +313,8 @@ extern "C"
     /* Returns PB_ERROR_INVALID_STATE with *number = 0 if a PinsBox is present but
      * not usable (e.g. used by another process, its GPIO / I/O expander could not
      * be initialized, or id 0 is used by another device; the reason is in the SDK
-     * log). No other device type is scanned then. */
+     * log). No other device type is scanned then. A later PBScan tries again (if
+     * id 0 is used by another device: not before the process ends). */
     PBAPI PB_ERROR_TYPE PBScan(int *number, int *ids);
 #ifdef __unix__
     /* Probes only the given port (as returned by PBGetPort, or a device node
@@ -335,6 +347,14 @@ extern "C"
     PBAPI PB_ERROR_TYPE PBGetUSBPortConfig(int id, PB_USB_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBSetUSBPortConfig(int id, PB_USB_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config);
+    /* The mask fields are applied in this order: auto mode, enable/power (only
+     * if auto mode is not switched on in the same call), threshold, over-current
+     * reset. On an error, the fields before are applied and the remaining ones
+     * are skipped: read the configuration again.
+     * PinsBox / PinsBox Mini: PB_ERROR_COMMUNICATION if the port could not be
+     * switched on (e.g. its PWM is not set up) or off, if enable/power is set
+     * while the port is in auto mode, and for MASK_PORT_OVERCURRENT_RESET (not
+     * supported). */
     PBAPI PB_ERROR_TYPE PBSetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config);
     /* MASK_PORT_ENABLE and MASK_PORT_VOLTAGE are applied in one call
@@ -425,6 +445,15 @@ extern "C"
      * fields are skipped: read the configuration again. */
     PBAPI PB_ERROR_TYPE PBSetBuckPortConfig(int id, PB_BUCK_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config);
+    /* Enable and power are applied in one step; switching off also sets the
+     * power to 0. Power alone while the port is off is not applied (the port
+     * stays off, PB_SUCCESS).
+     * PinsBox / PinsBox Mini: enabled with power 0 is "on" with no output (the
+     * PWM channel runs only with a power above 0), so a later power change takes
+     * effect. PB_ERROR_COMMUNICATION if the port could not be switched on (e.g.
+     * its PWM is not set up) or off, and for MASK_PORT_OVERCURRENT_RESET (not
+     * supported); the remaining mask fields are skipped then, read the
+     * configuration again. */
     PBAPI PB_ERROR_TYPE PBSetPWMPortConfig(int id, PB_PWM_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetWiFiConfig(int id, PB_WIFI_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBSetWiFiConfig(int id, PB_WIFI_CONFIG *config);

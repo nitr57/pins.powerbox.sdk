@@ -376,6 +376,8 @@ namespace PowerBox
         this->pwm_ = new PWM(chip, ch);
         this->taken_over_ = false;
         this->pwm_ok_ = false;
+        this->period_ = 0;
+        this->fast_retries_ = 0;
     }
 
     template <typename MCP, uint16_t kILIS>
@@ -393,12 +395,14 @@ namespace PowerBox
         unsigned int period = (unsigned int)(1e9 / freq);
         this->taken_over_ = false;
         this->pwm_ok_ = false;
-        if(keptIn >= 0 && this->pwm_->setExport())
+        this->period_ = period;
+        // A channel that is not exported cannot be taken over (and must not wait here)
+        if(keptIn >= 0 && this->pwm_->exists() && this->pwm_->setExport())
         {
             this->taken_over_ = this->pwm_->getPeriod() == period;
             if(!this->taken_over_)
             {
-                PB_INFO("PWM port %u: PWM not configured as expected, initialized off", port);
+                PB_INFO("PWM port: PWM not configured as expected, initialized off");
             }
         }
 
@@ -413,17 +417,68 @@ namespace PowerBox
             return true;
         }
 
-        RETURN_IF_ERROR(this->pwm_->setExport());
+        this->pwm_ok_ = this->initPwm_(true);
+        if(!this->pwm_ok_)
+        {
+            PB_ERROR("PWM port: PWM could not be set up, the port stays off (retried on the next switch request: every second for a while if the channel is exported, else at most every 30 s)");
+            // Exported but not writable yet (udev slow at boot): retry soon
+            this->fast_retries_ = 0;
+            this->next_retry_ = std::chrono::steady_clock::now() +
+                (this->pwm_->exists() ? std::chrono::seconds(1) : std::chrono::seconds(30));
+        }
+
+        return this->pwm_ok_;
+    }
+
+    template <typename MCP, uint16_t kILIS>
+    bool PWMPortT<MCP, kILIS>::initPwm_(bool wait)
+    {
+        if(!this->pwm_->setExport(wait))
+        {
+            return false;
+        }
+
         // Best effort first (the switch is already off): disable a channel that may
         // still run, and duty 0, because a duty above the new period would be
         // rejected. Right after an export the period may still be 0, then these
         // writes fail.
         this->pwm_->setState(0);
         this->pwm_->setDutyCycle(0);
-        RETURN_IF_ERROR(this->pwm_->setPeriod(period));
-        RETURN_IF_ERROR(this->pwm_->setDutyCycle(0));
-        RETURN_IF_ERROR(this->pwm_->setState(0));
 
+        return this->pwm_->setPeriod(this->period_) &&
+               this->pwm_->setDutyCycle(0) &&
+               this->pwm_->setState(0);
+    }
+
+    template <typename MCP, uint16_t kILIS>
+    bool PWMPortT<MCP, kILIS>::retryPwm_(void)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if(now < this->next_retry_)
+        {
+            return false;
+        }
+        this->next_retry_ = now + std::chrono::seconds(30);
+
+        // Only with the switch off (it could not be switched off otherwise)
+        if(this->bts_->getState() != 0)
+        {
+            return false;
+        }
+
+        if(!this->initPwm_(false))
+        {
+            // Exported, but udev has not made it writable yet: try again soon,
+            // a limited number of times (a failed try logs no error)
+            if(this->pwm_->exists() && this->fast_retries_ < FAST_RETRIES)
+            {
+                ++this->fast_retries_;
+                this->next_retry_ = now + std::chrono::seconds(1);
+            }
+            return false;
+        }
+
+        PB_INFO("PWM port: PWM set up after a retry");
         this->pwm_ok_ = true;
         return true;
     }
@@ -431,28 +486,33 @@ namespace PowerBox
     template <typename MCP, uint16_t kILIS>
     void PWMPortT<MCP, kILIS>::setState(uint8_t state, uint8_t dc)
     {
-        // Without a working PWM the switch must not be turned on
+        // Without a working PWM the switch must not be turned on. The PWM setup is
+        // retried now and then, with the switch off.
         if(!this->pwm_ok_)
         {
             this->bts_->setState(0);
-            return;
+            if(!this->retryPwm_())
+            {
+                return;
+            }
+        }
+
+        // Off never leaves the channel running (like the dew port)
+        if(!state)
+        {
+            dc = 0;
         }
 
         // Convert duty cycle to nano seconds
         unsigned int period = this->pwm_->getPeriod();
         unsigned int dutyCycle = (unsigned int)(((uint64_t)period * dc) / 255);
 
-        // Set duty cycle
+        // Like the dew port: the PWM channel only runs with a duty above 0, the
+        // switch follows the requested state. "On with 0" stays logically on
+        // (output 0), so a following power change takes effect (e.g. NINA sets
+        // the flat panel light on, then the brightness).
         this->pwm_->setDutyCycle(dutyCycle);
-
-        if(dutyCycle == 0)
-        {
-            // Turn off
-            this->pwm_->setState(0);
-            this->bts_->setState(0);
-        }
-
-        this->pwm_->setState(state);
+        this->pwm_->setState(dutyCycle != 0);
         this->bts_->setState(state);
     }
 

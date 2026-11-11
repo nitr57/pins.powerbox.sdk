@@ -31,6 +31,7 @@
 #include "MCP4725.h"
 #include "BTS7XXX.h"
 #include <cstdint>
+#include <chrono>
 
 namespace PowerBox
 {
@@ -148,7 +149,10 @@ namespace PowerBox
              * the requested period, the port is kept as it is (see isTakenOver()). */
             uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t port, unsigned int freq, uint8_t adc_ch = 2, float maxCurrent = 3.0f, int keptIn = -1);
             bool isTakenOver(void) const { return this->taken_over_; }
-            /* PWM channel set up; without it the switch is never turned on */
+            /* PWM channel set up; without it the switch is never turned on. A
+             * failed setup is retried on a switch request while the switch is
+             * off: every second (up to FAST_RETRIES times) while the channel is
+             * exported but not writable yet, else at most every 30 s. */
             bool isPwmOk(void) const { return this->pwm_ok_; }
 
             void enable(void) { this->bts_->enable(); }
@@ -166,6 +170,9 @@ namespace PowerBox
             void resetOverCurrent(void) { this->bts_->resetOverCurrent(); }
 
         private:
+            bool initPwm_(bool wait);
+            bool retryPwm_(void);
+
             const GPIOManager* gpio_;
             const MCP* mcp_;
 
@@ -173,6 +180,10 @@ namespace PowerBox
             PWM* pwm_;
             bool taken_over_;
             bool pwm_ok_;
+            static constexpr int FAST_RETRIES = 10;
+            unsigned int period_;
+            int fast_retries_;
+            std::chrono::steady_clock::time_point next_retry_;
     };
 
     /* Backward-compatible alias: the historical MCP3204 / BTS7080 PWM port */

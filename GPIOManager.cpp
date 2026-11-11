@@ -474,7 +474,8 @@ namespace PowerBox
         const int n = this->cm5_ngpio_;
         auto fail = [this](const char* what) {
             // State unknown: do not drive anything. Releasing the request leaves
-            // the lines as they are (pinctrl-rp1 persist_gpio_outputs, default on)
+            // the lines as they are (pinctrl-rp1 persist_gpio_outputs, default on;
+            // not yet verified on hardware)
             PB_ERROR("GPIOManager::InitGpiodKeep_ - %s, GPIO lines are not configured", what);
             gpiod_line_request_release(this->request_);
             this->request_ = nullptr;

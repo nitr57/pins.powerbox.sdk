@@ -29,37 +29,125 @@
 #include <fstream>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <atomic>
+#include "PowerBoxLogging.h"
+
+/* Separate, so a missing chip (e.g. PIO overlay) does not stop healthy chips from
+ * waiting for udev. Each channel waits at most 2 s for its export and 2 s for
+ * udev; after the first export timeout and the first udev timeout in the process
+ * no further channel waits for that (scan under the global mutex) */
+static std::atomic<bool> g_exportTimedOut{false};
+static std::atomic<bool> g_udevTimedOut{false};
+static const std::chrono::milliseconds EXPORT_TIMEOUT{2000};
+static const std::chrono::milliseconds EXPORT_POLL{50};
 
 PWM::PWM(const char* chip, int ch)
 {
     this->chip_ = "/sys/class/pwm/" + std::string(chip);
     this->channel_ = ch;
     this->exported_ = false;
+    this->exportErrorLogged_ = false;
 }
 
 PWM::~PWM(void)
 {
 }
 
-bool PWM::setExport(void)
+bool PWM::exists(void) const
+{
+    struct stat st;
+    return stat((this->chip_ + "/pwm" + std::to_string(this->channel_)).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool PWM::writable_(void) const
+{
+    // udev changes group and mode of all attributes, not in a fixed order
+    const std::string ch = this->chip_ + "/pwm" + std::to_string(this->channel_);
+    return access((ch + "/period").c_str(), W_OK) == 0 &&
+           access((ch + "/duty_cycle").c_str(), W_OK) == 0 &&
+           access((ch + "/enable").c_str(), W_OK) == 0;
+}
+
+bool PWM::setExport(bool wait)
 {
     if(this->exported_)
     {
         return true;
     }
 
-    // Already exported (e.g. by an earlier process): keep it as it is
-    struct stat st;
-    if(stat((this->chip_ + "/pwm" + std::to_string(this->channel_)).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+    const std::string name = this->chip_ + "/pwm" + std::to_string(this->channel_);
+
+    // Already exported (e.g. by an earlier process): keep it as it is, no wait
+    if(this->exists())
     {
         this->exported_ = true;
+        if(!this->writable_())
+        {
+            PB_ERROR("PWM %s is not writable (udev rule for /sys/class/pwm, group gpio?)", name.c_str());
+        }
         return true;
     }
 
-    this->exported_ = this->write_(this->chip_ + "/export", std::to_string(this->channel_));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // The chip or the permission for export may not be there yet at boot
+    const bool waitExport = wait && !g_exportTimedOut;
+    const auto exportDeadline = std::chrono::steady_clock::now() + (waitExport ? EXPORT_TIMEOUT : std::chrono::milliseconds(0));
+    for(;;)
+    {
+        if(this->write_(this->chip_ + "/export", std::to_string(this->channel_)) || this->exists())
+        {
+            break;
+        }
+        if(std::chrono::steady_clock::now() >= exportDeadline)
+        {
+            if(waitExport)
+            {
+                g_exportTimedOut = true;
+            }
+            // Retries keep failing the same way: report it once as error
+            if(!this->exportErrorLogged_)
+            {
+                PB_ERROR("PWM %s could not be exported (PWM overlay loaded? permission for %s/export?)", name.c_str(), this->chip_.c_str());
+                this->exportErrorLogged_ = true;
+            }
+            else
+            {
+                PB_DEBUG("PWM %s could not be exported", name.c_str());
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(EXPORT_POLL);
+    }
 
-    return this->exported_;
+    this->exported_ = true;
+
+    // udev makes the attributes group writable shortly after the export: own
+    // deadline from the export on, so a late chip still gets its udev time
+    const bool waitUdev = wait && !g_udevTimedOut;
+    const auto udevDeadline = std::chrono::steady_clock::now() + (waitUdev ? EXPORT_TIMEOUT : std::chrono::milliseconds(0));
+    while(!this->writable_())
+    {
+        if(std::chrono::steady_clock::now() >= udevDeadline)
+        {
+            if(waitUdev)
+            {
+                g_udevTimedOut = true;
+            }
+            if(wait)
+            {
+                PB_ERROR("PWM %s not writable after the export (udev rule for /sys/class/pwm, group gpio?)", name.c_str());
+            }
+            else
+            {
+                // A retry without waiting: udev is usually just not done yet
+                PB_DEBUG("PWM %s not writable yet after the export", name.c_str());
+            }
+            break;
+        }
+        std::this_thread::sleep_for(EXPORT_POLL);
+    }
+
+    return true;
 }
 
 bool PWM::setPeriod(unsigned int period_ns)

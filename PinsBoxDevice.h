@@ -200,7 +200,8 @@ namespace PowerBox
     };
 
     /* 1: PinsBox found (ids[0] = 0), 0: no PinsBox, -1: PinsBox present but not
-     * usable (used by another process, or GPIO / I/O expander init failed) */
+     * usable (used by another process, GPIO / I/O expander init failed, or id 0
+     * is used by another device) */
 #ifdef HAVE_LIBGPIOD
     int ScanPinsBox(int *ids);
 #else
