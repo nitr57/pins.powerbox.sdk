@@ -194,6 +194,9 @@ namespace PowerBox
             /* Serializes access to the shared SPI/I2C/GPIO hardware between the
              * listener thread and SDK API calls */
             std::mutex hwMutex_;
+
+            // Rate limits the log of a hung I2C bus during the USB measurement
+            ErrorThrottle usbBusError_;
             std::chrono::steady_clock::time_point lastEnergyUpdate_;
             std::chrono::steady_clock::time_point sessionStart_;
             bool energyUpdateInitialized_ = false;

@@ -133,8 +133,11 @@ extern "C"
     typedef struct _PB_USB_PORT_STATUS
     {
         int numPorts;                               /* Number of ports */
-        float current[PB_MAX_USB_PORTS];            /* Current draw [A] */
-        float voltage[PB_MAX_USB_PORTS];            /* Output voltage [V] */
+        float current[PB_MAX_USB_PORTS];            /* Current draw [A]; NaN = unknown (no sensor: PinsBox
+                                                       Mini/Light, StellaVita; PinsBox: port on, but no valid
+                                                       measurement, e.g. I2C error). PinsBox: 0 for a port
+                                                       that is off. */
+        float voltage[PB_MAX_USB_PORTS];            /* Output voltage [V]; NaN = unknown, as current */
         int overcurrent[PB_MAX_USB_PORTS];          /* Overcurrent flag */
         int readOnly[PB_MAX_POWER_PORTS];           /* Indicates if the port can be modified */
         int state[PB_MAX_USB_PORTS];                /* Port state (ON/OFF), also reflects over current shutdowns */
@@ -345,6 +348,17 @@ extern "C"
     PBAPI PB_ERROR_TYPE PBGetPowerPortConfig(int id, PB_POWER_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBSetPowerPortConfig(int id, PB_POWER_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetUSBPortConfig(int id, PB_USB_PORT_CONFIG *config);
+    /* PinsBox USB over current (software, INA219 measured about once per
+     * second, 68 ms average): a port is switched off and its overcurrent flag
+     * set if the current is above its limit (USB 1/2 2.6 A, USB 3/4 2.0 A,
+     * USB 5-8 1.2 A) in 2 measurements in a row, or at once at 1.5 x the limit
+     * or at the end of the measuring range (3.2 A); not at once in the first
+     * measurement after switching on (inrush). Measurements without a valid
+     * value (I2C error) in between do not reset the count; the port stays as it
+     * is while there is none (current NaN). Switching the port off, or on while
+     * it is off, clears the flag (a port whose switch-off failed stays flagged
+     * while the switch-off is retried); MASK_PORT_OVERCURRENT_RESET is not
+     * supported. */
     PBAPI PB_ERROR_TYPE PBSetUSBPortConfig(int id, PB_USB_PORT_CONFIG *config);
     PBAPI PB_ERROR_TYPE PBGetDewPortConfig(int id, PB_DEW_PORT_CONFIG *config);
     /* The mask fields are applied in this order: auto mode, enable/power (only

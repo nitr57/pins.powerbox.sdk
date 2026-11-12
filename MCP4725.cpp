@@ -24,6 +24,8 @@
 
 #include "MCP4725.h"
 #include "common.h"
+#include "I2CUtil.h"
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -84,6 +86,8 @@ namespace PowerBox
             this->i2c_fd_ = -1;
             return false;
         }
+
+        SetI2CTimeout(this->i2c_fd_, "MCP4725");
 
         // Find out what the DAC outputs right now (with retries: a running
         // converter is switched off if this fails)
@@ -280,7 +284,9 @@ namespace PowerBox
 
     bool MCP4725::waitReady_(void)
     {
-        for (int waited = 0; ; waited += 5)
+        // Wall time: a failing read can take up to the I2C timeout itself
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(MCP4725_EEPROM_TIMEOUT_MS);
+        for (;;)
         {
             uint8_t status;
             if (this->readState_(&status, nullptr, nullptr, nullptr) && (status & MCP4725_STATUS_READY))
@@ -288,7 +294,7 @@ namespace PowerBox
                 return true;
             }
 
-            if (waited >= MCP4725_EEPROM_TIMEOUT_MS)
+            if (std::chrono::steady_clock::now() >= deadline)
             {
                 return false;
             }

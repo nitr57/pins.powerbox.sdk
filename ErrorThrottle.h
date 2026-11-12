@@ -31,7 +31,9 @@ namespace PowerBox
 {
     /* Rate limiter for hardware errors that repeat every measurement cycle:
      * report the first failure, then at most once per interval, and report
-     * once when the operation works again. Not thread safe, the callers run
+     * once when the operation works again. The interval also applies across
+     * series, so an operation that fails every other cycle logs at most one
+     * failure and one recovery per interval. Not thread safe, the callers run
      * under the device's hardware lock. */
     class ErrorThrottle
     {
@@ -44,16 +46,19 @@ namespace PowerBox
             {
                 auto now = std::chrono::steady_clock::now();
                 ++this->failures_;
-                if (!this->failing_ || now - this->lastLog_ >= this->interval_)
+                this->failing_ = true;
+                if (!this->logged_ever_ || now - this->lastLog_ >= this->interval_)
                 {
-                    this->failing_ = true;
+                    this->logged_ever_ = true;
+                    this->logged_ = true;
                     this->lastLog_ = now;
                     return true;
                 }
                 return false;
             }
 
-            /* Records a success, returns true if it ended a series of failures */
+            /* Records a success, returns true if a logged failure should be
+             * followed by a recovery message now */
             bool succeed(void)
             {
                 if (!this->failing_)
@@ -62,7 +67,9 @@ namespace PowerBox
                 }
                 this->failing_ = false;
                 this->failures_ = 0;
-                return true;
+                bool report = this->logged_;
+                this->logged_ = false;
+                return report;
             }
 
             /* Number of failures since the last success */
@@ -71,7 +78,9 @@ namespace PowerBox
         private:
             std::chrono::seconds interval_;
             std::chrono::steady_clock::time_point lastLog_;
-            bool failing_ = false;
+            bool failing_ = false;      // the last operation failed
+            bool logged_ = false;       // a failure was logged since the last recovery message
+            bool logged_ever_ = false;  // a failure was ever logged
             unsigned failures_ = 0;
     };
 } /* namespace PowerBox */

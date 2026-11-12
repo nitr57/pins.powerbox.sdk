@@ -22,13 +22,37 @@
  * SOFTWARE.
  * **************************************************************************** */
 
-#include <math.h>
+
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
 #include "INA219.h"
+#include "I2CUtil.h"
+#include "PowerBoxLogging.h"
+
+#define INA219_REG_CONFIG        0x00
+#define INA219_REG_SHUNT_VOLTAGE 0x01
+#define INA219_REG_BUS_VOLTAGE   0x02
+#define INA219_REG_CALIBRATION   0x05
+
+/* BRNG 0 (16 V), PG 11 (/8, +-320 mV), BADC 0011 (12 bit), SADC 1111 (128
+ * samples, 68.1 ms), MODE 111 (shunt and bus, continuous). Power-on default
+ * is 0x399F (32 V, /8, 12 bit, continuous). */
+#define INA219_CONFIG_VALUE      0x19FF
+#define INA219_CONFIG_DEFAULT    0x399F
+#define INA219_CONFIG_PG_MASK    0x1800
+
+/* Current LSB 100 uA at 0.1 ohm: 0.04096 / (100e-6 * 0.1) = 4096, so the
+ * current register equals the shunt register (not used for the measurement) */
+#define INA219_CALIBRATION_VALUE 4096
+
+/* Transfer errors (no answer) happen now and then: retry, but not on a timeout */
+static const int INA219_ATTEMPTS = 3;
+static const useconds_t INA219_RETRY_DELAY_US = 500;
 
 namespace PowerBox
 {
@@ -36,9 +60,8 @@ namespace PowerBox
     {
         this->dev_ = dev;
         this->address_ = address;
-        this->config_  = 0x0;
         this->i2c_fd_ = -1;
-        this->current_lsb_ = 0.0f;
+        this->configured_ = false;
     }
 
     INA219::~INA219(void)
@@ -49,111 +72,243 @@ namespace PowerBox
         }
     }
 
-    uint8_t INA219::begin(uint16_t gain, float max_current)
+    INA219::Result INA219::begin(void)
     {
-        // Open I2C device
-        this->i2c_fd_ = open(this->dev_, O_RDWR);
+        this->configured_ = false;
+
+        Result res = OK;
+        const char* what = "could not be configured";
         if (this->i2c_fd_ < 0)
         {
-            return false;
+            int fd = open(this->dev_, O_RDWR);
+            if (fd < 0)
+            {
+                res = ERROR;
+                what = "failed to open the I2C device";
+            }
+            // Set I2C slave address (fails if a kernel driver uses the address)
+            else if (ioctl(fd, I2C_SLAVE, this->address_) < 0)
+            {
+                close(fd);
+                res = ERROR;
+                what = "failed to set the I2C address";
+            }
+            else
+            {
+                SetI2CTimeout(fd, "INA219");
+                this->i2c_fd_ = fd;
+            }
         }
 
-        // Set I2C slave address
-        if (ioctl(this->i2c_fd_, I2C_SLAVE, this->address_) < 0) {
-            close(this->i2c_fd_);
-            this->i2c_fd_ = -1;
-            return false;
+        if (res == OK)
+        {
+            res = this->configure_();
         }
 
-        // Set gain
-        this->config_ |= gain;
-        this->config_ |= 0x0180;
-        this->config_ |= 0x0018;
-        this->config_ |= 0x07;
-
-        this->writeRegister_(INA219_CONFIG, this->config_);
-
-        // Calibration with maximal expected current and shunt resistor
-        this->current_lsb_ = max_current / 32767.f;
-        uint16_t calibration = trunc(0.04096 / (this->current_lsb_ * 0.1f));
-        this->writeRegister_(INA219_CALIBRATION, calibration);
-
-        return true;
-    }
-
-    float INA219::getShuntVoltage_mV(void) const
-    {
-        // Shunt voltage can be negative, so we need signed integer
-        int16_t reg = this->readRegister_(INA219_SHUNT_VOLTAGE);
-
-        // Convert to mV (right-shift 2 bits, each LSB = 10uV = 0.01mV)
-        float shunt = (reg >> 2) * 0.01f;
-
-        return (shunt < 0.f ? 0.f : shunt);
-    }
-
-    uint16_t INA219::getBusVoltage_mV(void) const
-    {
-        // Read from register
-        uint16_t reg = this->readRegister_(INA219_BUS_VOLTAGE);
-
-        // Bus voltage can be negative, so we need signed integer
-        int16_t bus = (reg >> 3) * 4;
-
-        return (bus > 0 ? bus : 0);
-    }
-
-    uint16_t INA219::getCurrent_mA(void) const
-    {
-        // Current can be negativ, so we need signed integer
-        int16_t reg = this->readRegister_(INA219_CURRENT);
-
-        // Apply LSB and convert to mA
-        float current = reg * this->current_lsb_ * 1e3f;
-
-        return (current > 0.0f ? current : 0.0f);
-    }
-
-    uint16_t INA219::getPower_mW(void) const
-    {
-        // Power can be negativ, so we need signed integer
-        int16_t reg = this->readRegister_(INA219_POWER);
-
-        // Apply LSB and convert to mW
-        float power = reg * 20.f * this->current_lsb_ * 1e3f;
-
-        return (power > 0.0f ? power : 0.0f);
-    }
-
-    uint8_t INA219::writeRegister_(uint8_t reg, uint16_t val)
-    {
-        uint8_t buffer[3];
-        buffer[0] = reg;
-        buffer[1] = val >> 8;
-        buffer[2] = val & 0xff;
-
-        if (write(this->i2c_fd_, buffer, 3) != 3) {
-            return false;
+        if (res != OK)
+        {
+            if (this->setupError_.fail())
+            {
+                PB_ERROR("INA219 0x%02x: %s, no current measurement (retried, %u failures)", this->address_, what, this->setupError_.failures());
+            }
+            return res;
         }
 
-        return true;
+        // Report the recovery only after a logged failure
+        if (this->setupError_.succeed())
+        {
+            PB_INFO("INA219 0x%02x: set up again, current measurement works", this->address_);
+        }
+        this->configured_ = true;
+        return OK;
     }
 
-    uint16_t INA219::readRegister_(uint8_t reg) const
+    INA219::Result INA219::configure_(void)
     {
-        uint8_t buffer[1] = { reg };
-        
-        // Write register address
-        if (write(this->i2c_fd_, buffer, 1) != 1) {
-            return 0;
+        Result res = this->writeRegister_(INA219_REG_CONFIG, INA219_CONFIG_VALUE);
+        if (res == OK)
+        {
+            res = this->writeRegister_(INA219_REG_CALIBRATION, INA219_CALIBRATION_VALUE);
         }
 
-        // Read 2 bytes
-        uint8_t data[2];
-        if (read(this->i2c_fd_, data, 2) != 2) {
-            return 0;
+        uint16_t config = 0;
+        if (res == OK)
+        {
+            res = this->readRegister_(INA219_REG_CONFIG, config);
+        }
+        if (res == OK && config != INA219_CONFIG_VALUE)
+        {
+            res = ERROR;
+        }
+        return res;
+    }
+
+    INA219::Result INA219::checkConfig(bool& rewritten, bool& otherRange)
+    {
+        rewritten = false;
+        otherRange = false;
+
+        uint16_t config = 0;
+        Result res = this->readRegister_(INA219_REG_CONFIG, config);
+        if (res != OK)
+        {
+            return res;
         }
 
-        return ((data[0] << 8) | data[1]);
+        if (config == INA219_CONFIG_VALUE)
+        {
+            return OK;
+        }
+
+        // Reset (e.g. brown-out): the default is also +-320 mV, so the shunt value
+        // stays valid, but the averaging is lost. Any other value points to a bus
+        // fault (e.g. SDA held low reads 0x0000). Logged rate limited, with the
+        // number of occurrences since the start
+        rewritten = true;
+        otherRange = (config & INA219_CONFIG_PG_MASK) != (INA219_CONFIG_VALUE & INA219_CONFIG_PG_MASK);
+        res = this->configure_();
+        if (res == OK)
+        {
+            if (config == INA219_CONFIG_DEFAULT)
+            {
+                if (this->resetLog_.fail())
+                {
+                    PB_INFO("INA219 0x%02x: chip reset (configuration 0x%04x), configuration written again (%u times)", this->address_, config, this->resetLog_.failures());
+                }
+            }
+            else if (this->unexpectedLog_.fail())
+            {
+                PB_ERROR("INA219 0x%02x: unexpected configuration 0x%04x (bus fault?), written again (%u times)", this->address_, config, this->unexpectedLog_.failures());
+            }
+            return OK;
+        }
+
+        // The chip state is unknown (a bus fault may read 0 A): no measurement
+        // until begin() configures it again
+        this->configured_ = false;
+        if (this->setupError_.fail())
+        {
+            PB_ERROR("INA219 0x%02x: configuration 0x%04x found and could not be written again, no current measurement (retried, %u failures)", this->address_, config, this->setupError_.failures());
+        }
+        return res;
+    }
+
+    INA219::Result INA219::readShunt(int16_t& raw)
+    {
+        uint16_t reg;
+        Result res = this->readRegister_(INA219_REG_SHUNT_VOLTAGE, reg);
+        if (res == OK)
+        {
+            // Two's complement, 10 uV per LSB, not shifted; clamps at +-32000 (/8)
+            raw = (int16_t)reg;
+        }
+        return res;
+    }
+
+    INA219::Result INA219::readBus_mV(uint16_t& mV)
+    {
+        uint16_t reg;
+        Result res = this->readRegister_(INA219_REG_BUS_VOLTAGE, reg);
+        if (res == OK)
+        {
+            // Bits 15..3, 4 mV per LSB
+            mV = (uint16_t)((reg >> 3) * 4);
+        }
+        return res;
+    }
+
+    INA219::Result INA219::writeRegister_(uint8_t reg, uint16_t val)
+    {
+        if (this->i2c_fd_ < 0)
+        {
+            return ERROR;
+        }
+
+        uint8_t buffer[3] = { reg, (uint8_t)(val >> 8), (uint8_t)(val & 0xff) };
+        struct i2c_msg msg = { this->address_, 0, 3, buffer };
+        struct i2c_rdwr_ioctl_data data = { &msg, 1 };
+
+        for (int attempt = 0; attempt < INA219_ATTEMPTS; ++attempt)
+        {
+            int ret = ioctl(this->i2c_fd_, I2C_RDWR, &data);
+            if (ret == 1)
+            {
+                if (this->ioError_.succeed())
+                {
+                    PB_INFO("INA219 0x%02x: I2C access works again", this->address_);
+                }
+                return OK;
+            }
+
+            if (ret < 0 && errno == ETIMEDOUT)
+            {
+                if (this->ioError_.fail())
+                {
+                    PB_ERROR("INA219 0x%02x: I2C timeout writing register %u (%u failures)", this->address_, reg, this->ioError_.failures());
+                }
+                return TIMEOUT;
+            }
+
+            if (attempt + 1 < INA219_ATTEMPTS)
+            {
+                usleep(INA219_RETRY_DELAY_US);
+            }
+        }
+
+        if (this->ioError_.fail())
+        {
+            PB_ERROR("INA219 0x%02x: failed to write register %u (%u failures)", this->address_, reg, this->ioError_.failures());
+        }
+        return ERROR;
+    }
+
+    INA219::Result INA219::readRegister_(uint8_t reg, uint16_t& val)
+    {
+        if (this->i2c_fd_ < 0)
+        {
+            return ERROR;
+        }
+
+        // Register pointer and read in one transfer (repeated start)
+        uint8_t data[2] = { 0, 0 };
+        struct i2c_msg msgs[2] = {
+            { this->address_, 0, 1, &reg },
+            { this->address_, I2C_M_RD, 2, data }
+        };
+        struct i2c_rdwr_ioctl_data xfer = { msgs, 2 };
+
+        for (int attempt = 0; attempt < INA219_ATTEMPTS; ++attempt)
+        {
+            int ret = ioctl(this->i2c_fd_, I2C_RDWR, &xfer);
+            if (ret == 2)
+            {
+                if (this->ioError_.succeed())
+                {
+                    PB_INFO("INA219 0x%02x: I2C access works again", this->address_);
+                }
+                val = (uint16_t)((data[0] << 8) | data[1]);
+                return OK;
+            }
+
+            if (ret < 0 && errno == ETIMEDOUT)
+            {
+                if (this->ioError_.fail())
+                {
+                    PB_ERROR("INA219 0x%02x: I2C timeout reading register %u (%u failures)", this->address_, reg, this->ioError_.failures());
+                }
+                return TIMEOUT;
+            }
+
+            if (attempt + 1 < INA219_ATTEMPTS)
+            {
+                usleep(INA219_RETRY_DELAY_US);
+            }
+        }
+
+        if (this->ioError_.fail())
+        {
+            PB_ERROR("INA219 0x%02x: failed to read register %u (%u failures)", this->address_, reg, this->ioError_.failures());
+        }
+        return ERROR;
     }
 } /* namespace PowerBox */

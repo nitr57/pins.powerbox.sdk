@@ -780,6 +780,8 @@ namespace PowerBox
         // show up as success in the API
         bool ok = this->pwr_[i]->setState(state);
         this->powerState[i] = this->pwr_[i]->getState();
+        // Switching clears the over current flag: show it in the status at once
+        this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
         return ok;
     }
 

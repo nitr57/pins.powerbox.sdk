@@ -25,6 +25,7 @@
 #include "TCA953X.h"
 #include "common.h"
 #include "PowerBoxLogging.h"
+#include "I2CUtil.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -83,6 +84,7 @@ uint8_t TCA953X_<PINS>::begin(void)
     }
 
     PB_DEBUG("TCA953X configured to address 0x%02x", this->address_);
+    PowerBox::SetI2CTimeout(this->i2c_fd_, "TCA953X");
     this->init_ = true;
     return true;
 }

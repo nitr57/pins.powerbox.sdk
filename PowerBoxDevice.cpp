@@ -1006,6 +1006,13 @@ namespace PowerBox
 
         this->powerState[i] = state != 0;
 
+        // The firmware clears the over current flag when it switches a port on:
+        // show it at once instead of with the next status message
+        if (state != 0)
+        {
+            this->powerOvercurrent[i] = 0;
+        }
+
         return true;
     }
 
@@ -1051,6 +1058,13 @@ namespace PowerBox
         }
 
         this->usbState[i] = state != 0;
+
+        // The firmware clears the over current flag when it switches a port on:
+        // show it at once instead of with the next status message
+        if (state != 0)
+        {
+            this->usbOvercurrent[i] = 0;
+        }
 
         return true;
     }

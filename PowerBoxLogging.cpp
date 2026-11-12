@@ -42,20 +42,55 @@ namespace PowerBox
 		return timestamp;
 	}
 
+	/* Formats the whole line into one buffer and writes it with one call, so
+	 * lines of different threads do not interleave (longer lines are cut) */
+	static void PBLogLine(const char *level, const char *fmt, va_list args)
+	{
+		char line[1024];
+		size_t len = 0;
+		int n;
+
+		if (PowerBox::PB_TIMESTAMP_ENABLED)
+		{
+			char timestamp[20] = "";
+			time_t now = time(nullptr);
+			struct tm timeinfo;
+#ifdef _WIN32
+			if (localtime_s(&timeinfo, &now) == 0)
+#else
+			if (localtime_r(&now, &timeinfo) != nullptr)
+#endif
+			{
+				strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &timeinfo);
+			}
+			n = snprintf(line, sizeof(line), "[%s] [%s] ", timestamp, level);
+		}
+		else
+		{
+			n = snprintf(line, sizeof(line), "[%s] ", level);
+		}
+		if (n > 0)
+		{
+			len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+		}
+
+		// Keep room for the newline
+		n = vsnprintf(line + len, sizeof(line) - len - 1, fmt, args);
+		if (n > 0)
+		{
+			len += (size_t)n < sizeof(line) - len - 1 ? (size_t)n : sizeof(line) - len - 2;
+		}
+		line[len++] = '\n';
+		line[len] = '\0';
+
+		fputs(line, stderr);
+	}
+
 	void PBLogDebug(const char *fmt, ...)
 	{
 		va_list args;
 		va_start(args, fmt);
-		if (PowerBox::PB_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [PB_DEBUG] ", PBGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[PB_DEBUG] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
+		PBLogLine("PB_DEBUG", fmt, args);
 		va_end(args);
 	}
 
@@ -63,16 +98,7 @@ namespace PowerBox
 	{
 		va_list args;
 		va_start(args, fmt);
-		if (PowerBox::PB_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [PB_INFO] ", PBGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[PB_INFO] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
+		PBLogLine("PB_INFO", fmt, args);
 		va_end(args);
 	}
 
@@ -80,16 +106,7 @@ namespace PowerBox
 	{
 		va_list args;
 		va_start(args, fmt);
-		if (PowerBox::PB_TIMESTAMP_ENABLED)
-		{
-			fprintf(stderr, "[%s] [PB_ERROR] ", PBGetTimestamp());
-		}
-		else
-		{
-			fprintf(stderr, "[PB_ERROR] ");
-		}
-		vfprintf(stderr, fmt, args);
-		fprintf(stderr, "\n");
+		PBLogLine("PB_ERROR", fmt, args);
 		va_end(args);
 	}
 

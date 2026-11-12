@@ -23,6 +23,7 @@
  * **************************************************************************** */
 
 #include "StellaVitaDevice.h"
+#include <limits>
 #include "PowerBoxLogging.h"
 #include "Device.h"
 #include "DeviceUtil.h"
@@ -130,6 +131,9 @@ namespace PowerBox
         {
             this->usbBootstrap[i] = 1; // USB ports default on
             this->usbState[i]     = 1;
+            // No current/voltage sensor: unknown
+            this->usbCurrent[i]   = std::numeric_limits<float>::quiet_NaN();
+            this->usbVoltage[i]   = std::numeric_limits<float>::quiet_NaN();
         }
     }
 

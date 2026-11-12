@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -367,14 +368,14 @@ namespace PowerBox
         // Initialize USB ports
         // Ports 5/6 and 7/8 use swapped enable pins and INA219 addresses; the boot
         // state always belongs to the API index (usb_[k] <- usbBootstrap[k])
-        this->usb_[0]->begin(USB_PINS[0], 0x40, 2.6f, initState(USB_PINS[0], this->usbBootstrap[0]));
-        this->usb_[1]->begin(USB_PINS[1], 0x41, 2.6f, initState(USB_PINS[1], this->usbBootstrap[1]));
-        this->usb_[2]->begin(USB_PINS[2], 0x42, 2.0f, initState(USB_PINS[2], this->usbBootstrap[2]));
-        this->usb_[3]->begin(USB_PINS[3], 0x43, 2.0f, initState(USB_PINS[3], this->usbBootstrap[3]));
-        this->usb_[5]->begin(USB_PINS[4], 0x44, 1.2f, initState(USB_PINS[4], this->usbBootstrap[5]));
-        this->usb_[4]->begin(USB_PINS[5], 0x45, 1.2f, initState(USB_PINS[5], this->usbBootstrap[4]));
-        this->usb_[6]->begin(USB_PINS[7], 0x47, 1.2f, initState(USB_PINS[7], this->usbBootstrap[6]));
-        this->usb_[7]->begin(USB_PINS[6], 0x46, 1.2f, initState(USB_PINS[6], this->usbBootstrap[7]));
+        this->usb_[0]->begin(USB_PINS[0], 0x40, 2.6f, initState(USB_PINS[0], this->usbBootstrap[0]), 0);
+        this->usb_[1]->begin(USB_PINS[1], 0x41, 2.6f, initState(USB_PINS[1], this->usbBootstrap[1]), 1);
+        this->usb_[2]->begin(USB_PINS[2], 0x42, 2.0f, initState(USB_PINS[2], this->usbBootstrap[2]), 2);
+        this->usb_[3]->begin(USB_PINS[3], 0x43, 2.0f, initState(USB_PINS[3], this->usbBootstrap[3]), 3);
+        this->usb_[5]->begin(USB_PINS[4], 0x44, 1.2f, initState(USB_PINS[4], this->usbBootstrap[5]), 5);
+        this->usb_[4]->begin(USB_PINS[5], 0x45, 1.2f, initState(USB_PINS[5], this->usbBootstrap[4]), 4);
+        this->usb_[6]->begin(USB_PINS[7], 0x47, 1.2f, initState(USB_PINS[7], this->usbBootstrap[6]), 6);
+        this->usb_[7]->begin(USB_PINS[6], 0x46, 1.2f, initState(USB_PINS[6], this->usbBootstrap[7]), 7);
 
         // Dew ports
         this->dew_ = new DewPort*[PINSBOX_NUM_DEW_PORTS];
@@ -996,16 +997,32 @@ namespace PowerBox
             this->powerState[i] = i == 0 ? 1 : this->pwr_[i]->getState();
         }
         
+        // I2C results of this pass: from USB::BUS_TIMEOUT_LIMIT timeouts on, the
+        // remaining ports skip the bus (a hung bus would block the hardware lock)
+        USB::BusPass i2cPass;
         for(int i = 0; i < PINSBOX_NUM_USB_PORTS; ++i)
         {
             std::lock_guard<std::mutex> lock(this->hwMutex_);
-            this->usb_[i]->measureVoltage();
-            this->usb_[i]->measureCurrent();
-            
-            this->usbCurrent[i] = this->usb_[i]->getCurrent_mA() * 0.001f;
-            this->usbVoltage[i] = this->usb_[i]->getVoltage_mV() * 0.001f;
+            this->usb_[i]->measure(i2cPass);
+
+            // NaN: port on, but no valid measurement (I2C error)
+            bool valid = this->usb_[i]->isValid();
+            this->usbCurrent[i] = valid ? this->usb_[i]->getCurrent_mA() * 0.001f : std::numeric_limits<float>::quiet_NaN();
+            this->usbVoltage[i] = valid ? this->usb_[i]->getVoltage_mV() * 0.001f : std::numeric_limits<float>::quiet_NaN();
             this->usbOvercurrent[i] = this->usb_[i]->getOverCurrent() ? 1 : 0;
             this->usbState[i] = this->usb_[i]->getState();
+        }
+
+        if(i2cPass.timeouts >= USB::BUS_TIMEOUT_LIMIT)
+        {
+            if(this->usbBusError_.fail())
+            {
+                PB_ERROR("PinsBox: I2C bus times out, USB current measurement skipped (%u passes)", this->usbBusError_.failures());
+            }
+        }
+        else if(i2cPass.timeouts == 0 && i2cPass.answered && this->usbBusError_.succeed())
+        {
+            PB_INFO("PinsBox: I2C bus answers again, USB current measurement works");
         }
 
         // Dew ports
@@ -1103,6 +1120,8 @@ namespace PowerBox
         // show up as success in the API
         bool ok = this->pwr_[i]->setState(state);
         this->powerState[i] = this->pwr_[i]->getState();
+        // Switching clears the over current flag: show it in the status at once
+        this->powerOvercurrent[i] = this->pwr_[i]->getOverCurrent() ? 1 : 0;
         return ok;
     }
 
@@ -1136,6 +1155,8 @@ namespace PowerBox
         // show up as success in the API
         bool ok = state ? this->usb_[i]->enable() : this->usb_[i]->disable();
         this->usbState[i] = this->usb_[i]->getState();
+        // Switching clears the over current flag: show it in the status at once
+        this->usbOvercurrent[i] = this->usb_[i]->getOverCurrent() ? 1 : 0;
         return ok;
     }
 
