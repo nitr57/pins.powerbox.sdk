@@ -28,6 +28,7 @@
 #include "Device.h"
 #include "GPIOManager.h"
 #include "PWM.h"
+#include "Buzzer.h"
 #include <limits>
 #include <string>
 #include <thread>
@@ -130,7 +131,7 @@ namespace PowerBox
             void SaveSettings(void);
 
             GPIOManager *gpio_;
-            PWM         *buzzer_;
+            Buzzer      *buzzer_ = nullptr;
 
             std::thread statusListenerThread_;
     };

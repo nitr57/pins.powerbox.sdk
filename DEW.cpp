@@ -38,7 +38,9 @@ namespace PowerBox
         this->pwm_ok_ = false;
         this->avg_duty_ = 0.f;
         this->holding_ = false;
-        this->hold_error_logged_ = false;
+        this->in_use_ = false;
+        this->probe_seen_ = false;
+        this->hold_logged_ = HoldLog::Nothing;
         this->runaway_running_ = false;
         this->runaway_warned_ = false;
         this->runaway_temperature_ = 0.f;
@@ -103,8 +105,8 @@ namespace PowerBox
         // probe is read for the first time one cycle after begin)
         auto now = std::chrono::steady_clock::now();
         this->holding_ = false;
-        this->hold_error_logged_ = false;
-        this->start_window_end_ = now + START_WINDOW;
+        this->hold_logged_ = HoldLog::Nothing;
+        this->restartWindows_(now);
         this->runaway_running_ = false;
         this->runaway_warned_ = false;
         this->avg_time_ = now;
@@ -192,7 +194,16 @@ namespace PowerBox
     }
 
     template <typename MCP>
-    void DewPortT<MCP>::update(float dewPoint, float threshold)
+    void DewPortT<MCP>::restartWindows_(std::chrono::steady_clock::time_point now)
+    {
+        this->in_use_ = false;
+        this->probe_seen_ = false;
+        this->start_window_end_ = now + START_WINDOW;
+        this->setup_window_end_ = now + SETUP_WINDOW;
+    }
+
+    template <typename MCP>
+    void DewPortT<MCP>::update(float dewPoint, float threshold, int dataInterval)
     {
         // Read the probe once per cycle (result of the conversion started by the
         // previous cycle) and start the next conversion
@@ -209,6 +220,15 @@ namespace PowerBox
             bool dewPointOk = dewPoint != DEVICE_DISCONNECTED_C;
             auto now = std::chrono::steady_clock::now();
 
+            if(probeOk)
+            {
+                this->probe_seen_ = true;
+            }
+            if(probeOk && dewPointOk)
+            {
+                this->in_use_ = true;
+            }
+
             if(!probeOk || !dewPointOk)
             {
                 // Keep the average duty (see DUTY_AVERAGE_TIME)
@@ -217,46 +237,70 @@ namespace PowerBox
                 const char* what = !probeOk && !dewPointOk ? "probe temperature and dew point" :
                                    (!probeOk ? "probe temperature" : "dew point");
 
-                // An error only while the heater runs without regulation; with
-                // duty 0 (e.g. a port in auto mode without a probe) it is info
                 if(!this->holding_)
                 {
                     this->holding_ = true;
-                    this->hold_error_logged_ = now >= this->start_window_end_;
-                    if(!this->hold_error_logged_)
+                    this->hold_since_ = now;
+                    this->hold_logged_ = HoldLog::Nothing;
+                    if(now < this->start_window_end_)
                     {
                         PB_INFO("Dew port %u: waiting for a valid %s, keeping duty %u", this->port_, what, hold);
+                        this->hold_logged_ = HoldLog::Waiting;
                     }
-                    else if(hold != 0)
-                    {
-                        PB_ERROR("Dew port %u: no valid %s, keeping duty %u (average of the last minutes) until the data is valid again", this->port_, what, hold);
-                    }
-                    else
-                    {
-                        PB_INFO("Dew port %u: no valid %s, the heater stays off until the data is valid", this->port_, what);
-                    }
-                    this->setState_(hold != 0, hold);
                 }
-                else
+
+                // Logged once per episode, after the start window and the
+                // debounce (see START_WINDOW). Info can turn into an error later
+                // (a probe appears, the setup window ends).
+                auto debounce = std::max<std::chrono::seconds>(HOLD_DEBOUNCE, std::chrono::seconds(2 * std::max(dataInterval, 1) + 1));
+                if(now >= this->start_window_end_ && now - this->hold_since_ >= debounce &&
+                   this->hold_logged_ != HoldLog::Error)
                 {
-                    if(!this->hold_error_logged_ && now >= this->start_window_end_)
+                    bool unregulated = !this->in_use_ && !this->probe_seen_ && hold != 0;
+                    bool notSetUp = !this->in_use_ && this->probe_seen_ && now >= this->setup_window_end_;
+                    if(this->in_use_ || unregulated || notSetUp)
                     {
-                        if(hold != 0)
+                        // A throttled error is tried again every cycle: it is
+                        // logged once the interval is over
+                        if(this->hold_error_.fail())
                         {
-                            PB_ERROR("Dew port %u: still no valid %s, keeping duty %u until the data is valid", this->port_, what, hold);
+                            this->hold_logged_ = HoldLog::Error;
+                            if(this->in_use_ && hold != 0)
+                            {
+                                PB_ERROR("Dew port %u: no valid %s, regulation stopped, keeping duty %u (average of the last minutes) until the data is valid again", this->port_, what, hold);
+                            }
+                            else if(this->in_use_)
+                            {
+                                PB_ERROR("Dew port %u: no valid %s, regulation stopped, the heater stays off until the data is valid again", this->port_, what);
+                            }
+                            else if(unregulated)
+                            {
+                                PB_ERROR("Dew port %u: no valid %s, the heater runs unregulated at duty %u (probe connected?)", this->port_, what, hold);
+                            }
+                            else
+                            {
+                                PB_ERROR("Dew port %u: no valid %s since the start or auto-on, the heater is not regulated, keeping duty %u (dew point source connected?)", this->port_, what, hold);
+                            }
+                        }
+                    }
+                    else if(this->hold_logged_ == HoldLog::Nothing || this->hold_logged_ == HoldLog::Waiting)
+                    {
+                        this->hold_logged_ = HoldLog::Info;
+                        if(!this->probe_seen_)
+                        {
+                            PB_INFO("Dew port %u: no valid %s (no probe connected?), keeping duty %u", this->port_, what, hold);
                         }
                         else
                         {
-                            PB_INFO("Dew port %u: still no valid %s, the heater stays off until the data is valid", this->port_, what);
+                            PB_INFO("Dew port %u: still waiting for a valid %s, keeping duty %u", this->port_, what, hold);
                         }
-                        this->hold_error_logged_ = true;
                     }
-
-                    // Applied every cycle like the regulation does: a failed switch
-                    // on is retried, and without a working PWM the PWM setup is
-                    // retried (rate limited) with the switch off
-                    this->setState_(hold != 0, hold);
                 }
+
+                // Applied every cycle like the regulation does: a failed switch
+                // on is retried, and without a working PWM the PWM setup is
+                // retried (rate limited) with the switch off
+                this->setState_(hold != 0, hold);
 
                 this->runaway_running_ = false;
                 this->runaway_warned_ = false;
@@ -266,7 +310,15 @@ namespace PowerBox
                 if(this->holding_)
                 {
                     this->holding_ = false;
-                    PB_INFO("Dew port %u: probe temperature and dew point valid, regulating", this->port_);
+
+                    // Recovery reported only if this episode was (a throttled
+                    // error leaves no trace to recover from)
+                    bool errorLogged = this->hold_error_.succeed();
+                    if(errorLogged || this->hold_logged_ == HoldLog::Waiting || this->hold_logged_ == HoldLog::Info)
+                    {
+                        PB_INFO("Dew port %u: probe temperature and dew point valid, regulating", this->port_);
+                    }
+                    this->hold_logged_ = HoldLog::Nothing;
                 }
 
                 // Temperture difference between current and dew point
@@ -390,11 +442,20 @@ namespace PowerBox
             this->avg_time_ = std::chrono::steady_clock::now();
             this->runaway_running_ = false;
             this->runaway_warned_ = false;
+
+            // In use again once it regulates; sensors get their start window
+            this->restartWindows_(this->avg_time_);
         }
 
         if(mode == 0 || !this->auto_mode_)
         {
+            // An episode ends with auto mode (no recovery message then)
+            if(this->holding_)
+            {
+                this->hold_error_.succeed();
+            }
             this->holding_ = false;
+            this->hold_logged_ = HoldLog::Nothing;
         }
 
         this->auto_mode_ = mode != 0;

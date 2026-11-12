@@ -93,11 +93,11 @@ extern "C"
     {
         unsigned int mask;              /* Used by PBSetConfig() to indicate which field wants to be set */
         float temperatureOffset;        /* Temperature offset [-12.5, +12.5] [°C] */
-        float humidityOffset;           /* Temperature offset [-12.5, +12.5] [%] */
+        float humidityOffset;           /* Humidity offset [-12.5, +12.5] [%] */
         int envUpdateRate;              /* Sensor refresh rate [s], default: 3s */
         int updateRate;                 /* Property refresh rate [s], default: 1s */
-        float temperature;              /* Set temperature externally */
-        float humidity;                 /* Set humidity externally */
+        float temperature;              /* Set temperature externally (-50, 80) [°C] */
+        float humidity;                 /* Set humidity externally (0, 100] [%]; both are checked before either is set */
     } PB_DEVICE_CONFIG;
 
     typedef struct _PB_DEVICE_STATUS
@@ -571,6 +571,13 @@ extern "C"
     PBAPI PB_ERROR_TYPE PBGetVersion(int id, PB_VERSION *version);
 
     /* Utility */
+    /* Starts a tone and returns at once (it does not wait for the tone to end).
+     * volume 0..100 (clamped; up to 50 it sets the duty, 50..100 are all the
+     * loudest; 0 ends a running tone, with any duration), duration_ms > 0
+     * (longer than 10000 is clamped to 10000). A new call replaces a running
+     * tone. PB_ERROR_NOT_AVAILABLE on a
+     * device without a buzzer, PB_ERROR_COMMUNICATION if the tone could not
+     * be started. */
     PBAPI PB_ERROR_TYPE PBBeep(int id, int volume, int duration_ms);
     PBAPI PB_ERROR_TYPE PBRestart(int id);
     PBAPI PB_ERROR_TYPE PBFactoryReset(int id);

@@ -26,6 +26,7 @@
 
 #include "PowerBoxSDK.h"
 #include "PowerBoxLogging.h"
+#include "ErrorThrottle.h"
 #include "PowerBoxDevice.h"
 #include "PinsBoxDevice.h"
 #include "PinsBoxLightDevice.h"
@@ -256,6 +257,34 @@ PBAPI PB_ERROR_TYPE PBSetConfig(int id, PB_DEVICE_CONFIG *config)
     }
 
     auto device = it->second;
+
+    // External temperature and humidity are both checked before anything is
+    // applied: a rejected value never leaves a half update (a new temperature
+    // with the old humidity). NaN fails the comparisons. Callers push these
+    // every second: the log is rate limited (under g_globalMutex), and info:
+    // a bad value of the caller's weather source is ignored, its consequence
+    // (no dew point) is reported by the dew ports.
+    static ErrorThrottle extRangeError(std::chrono::seconds(60));
+    if ((config->mask & MASK_PB_EXT_TEMPERATURE) && !(config->temperature > -50.f && config->temperature < 80.f))
+    {
+        if (extRangeError.fail())
+        {
+            PB_INFO("PBSetConfig: External temperature %.2f out of range (-50, 80), ignored (%u times)", config->temperature, extRangeError.failures());
+        }
+        return PB_ERROR_INVALID_PARAMETER;
+    }
+    if ((config->mask & MASK_PB_EXT_HUMIDITY) && !(config->humidity > 0.f && config->humidity <= 100.f))
+    {
+        if (extRangeError.fail())
+        {
+            PB_INFO("PBSetConfig: External humidity %.2f out of range (0, 100], ignored (%u times)", config->humidity, extRangeError.failures());
+        }
+        return PB_ERROR_INVALID_PARAMETER;
+    }
+    if (config->mask & (MASK_PB_EXT_TEMPERATURE | MASK_PB_EXT_HUMIDITY))
+    {
+        extRangeError.succeed();
+    }
 
     if (config->mask & MASK_PB_TEMPERATURE_OFFSET)
     {
@@ -1227,11 +1256,18 @@ PBAPI PB_ERROR_TYPE PBBeep(int id, int volume, int duration_ms)
         return PB_ERROR_INVALID_ID;
     }
 
+    // Starts the tone and returns at once, so the global lock is held only for
+    // a few sysfs writes
     auto device = it->second;
     PB_ERROR_TYPE result = device->Beep(volume, duration_ms);
     if (result == PB_SUCCESS)
     {
         PB_DEBUG("PBBeep: Device beep triggered");
+    }
+    else if (result == PB_ERROR_NOT_AVAILABLE)
+    {
+        // A device without a buzzer: not a fault
+        PB_INFO("PBBeep: Device id=%d has no buzzer", id);
     }
     else
     {

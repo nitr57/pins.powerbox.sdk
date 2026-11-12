@@ -434,8 +434,8 @@ namespace PowerBox
         this->pwmPWM = this->pwm_->getDutyCycle();
 
         // Initialize buzzer PWM on GPIO16 (pwmchip2, channel 0)
-        this->buzzer_ = new PWM("pwmchip2", 0);
-        this->buzzer_->setExport();
+        this->buzzer_ = new Buzzer("pwmchip2", 0);
+        this->buzzer_->begin();
 
         // Boot states are written: later starts in this boot take the states over
         if(!sameBoot && !bootId.empty())
@@ -1031,7 +1031,7 @@ namespace PowerBox
         for(int i = 0; i < PINSBOX_NUM_DEW_PORTS; ++i)
         {
             std::lock_guard<std::mutex> lock(this->hwMutex_);
-            this->dew_[i]->update(this->dewPoint, this->dewThreshold[i]);
+            this->dew_[i]->update(this->dewPoint, this->dewThreshold[i], this->envUpdateRate);
             this->dewCurrent[i] = this->dew_[i]->getCurrent_mA() * 0.001f;
             this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
             this->dewProbe[i] = std::round(this->dew_[i]->getTemperature() * 100.0f) / 100.0f;
@@ -1333,44 +1333,8 @@ namespace PowerBox
 
     PB_ERROR_TYPE PinsBoxDevice::Beep(int volume, int duration_ms)
     {
-        if (!this->buzzer_ || duration_ms <= 0)
-        {
-            return PB_ERROR_INVALID_PARAMETER;
-        }
-
-        // Clamp volume to 0-100 range
-        volume = (volume < 0) ? 0 : (volume > 100) ? 100 : volume;
-
-        // If volume is 0, no beep
-        if (volume == 0)
-        {
-            return PB_SUCCESS;
-        }
-
-        // FUET-7525 sweet spot is 2700 Hz
-        const unsigned int BUZZER_FREQ_HZ = 2700;
-        const unsigned int PERIOD_NS = 1000000000 / BUZZER_FREQ_HZ;
-
-        // Set period if not already set
-        if (this->buzzer_->getPeriod() != PERIOD_NS)
-        {
-            this->buzzer_->setPeriod(PERIOD_NS);
-        }
-
-        // Calculate duty cycle based on volume (0-100%)
-        unsigned int duty_ns = (PERIOD_NS * volume) / 100;
-        this->buzzer_->setDutyCycle(duty_ns);
-
-        // Enable PWM
-        this->buzzer_->setState(true);
-
-        // Sleep for the specified duration
-        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
-
-        // Disable PWM
-        this->buzzer_->setState(false);
-
-        return PB_SUCCESS;
+        // Starts the tone and returns at once
+        return this->buzzer_ ? this->buzzer_->beep(volume, duration_ms) : PB_ERROR_NOT_AVAILABLE;
     }
 
 

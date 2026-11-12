@@ -34,6 +34,7 @@
 #include "DHT22.h"
 #include "ADJ.h"
 #include "PWM.h"
+#include "Buzzer.h"
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -172,7 +173,7 @@ namespace PowerBox
             BTS7012<MCP3202>** pwr_;
             DewPortT<MCP3202>** dew_;
             PWMPortT<MCP3202, 4785>* pwm_;
-            PWM* buzzer_;
+            Buzzer* buzzer_ = nullptr;
             std::thread statusListenerThread_;
             std::thread dht22Thread_;
             std::atomic<bool> dht22ThreadRunning_{false};

@@ -35,6 +35,7 @@
 #include "DEW.h"
 #include "DHT22.h"
 #include "PWM.h"
+#include "Buzzer.h"
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -182,7 +183,7 @@ namespace PowerBox
             DewPort** dew_ = nullptr;
             BuckPort* buck_ = nullptr;
             PWMPort* pwm_ = nullptr;
-            PWM* buzzer_ = nullptr;
+            Buzzer* buzzer_ = nullptr;
 
             bool initOk_ = false;
             // Destroyed after the destructor body, i.e. after the GPIO lines and

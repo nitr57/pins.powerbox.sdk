@@ -172,6 +172,17 @@ unsigned int PWM::getPeriod(void) const
     return val.empty() ? 0 : (unsigned int)std::strtoul(val.c_str(), nullptr, 10);
 }
 
+bool PWM::readPeriod(unsigned int& period_ns) const
+{
+    std::string val = this->read_(this->chip_ + "/pwm" + std::to_string(this->channel_) + "/period");
+    if(val.empty())
+    {
+        return false;
+    }
+    period_ns = (unsigned int)std::strtoul(val.c_str(), nullptr, 10);
+    return true;
+}
+
 unsigned int PWM::getDutyCycle(void) const
 {
     std::string val = this->read_(this->chip_ + "/pwm" + std::to_string(this->channel_) + "/duty_cycle");

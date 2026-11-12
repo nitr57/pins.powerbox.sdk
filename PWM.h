@@ -49,6 +49,8 @@ class PWM
         bool setState(bool state);
 
         unsigned int getPeriod(void) const;
+        /* false if the period could not be read (getPeriod() reads 0 then) */
+        bool readPeriod(unsigned int& period_ns) const;
         unsigned int getDutyCycle(void) const;
         int getState(void) const;
 

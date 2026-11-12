@@ -30,6 +30,7 @@
 #include "MCP320X.h"
 #include "BTS7XXX.h"
 #include "DS18B20.h"
+#include "ErrorThrottle.h"
 #include <cstdint>
 #include <chrono>
 
@@ -48,7 +49,10 @@ namespace PowerBox
              * enable); otherwise it is initialized off. */
             /* index: port number used in log messages (the API index); -1 = port */
             uint8_t begin(uint8_t diag_pin, uint8_t pwr_pin, uint8_t sel_pin, uint8_t probe_pin, uint8_t port, unsigned int freq, bool mode, uint8_t adc_ch = 2, int keptIn = -1, int index = -1);
-            void update(float dewPoint, float threshold);
+            /* dataInterval: seconds between updates of the dew point (the
+             * environment update rate); a gap shorter than two of them is not
+             * reported */
+            void update(float dewPoint, float threshold, int dataInterval = 3);
 
             void enable(void) { this->bts_->enable(); }
             void disable(void) { this->bts_->disable(); }
@@ -105,15 +109,36 @@ namespace PowerBox
              * the regulated duty; starts from the output when the port is set up
              * or auto mode is switched on) until the data is valid again. The
              * port is not switched off: no data is not a reason to let the
-             * optics fog up. Logged as info during START_WINDOW after begin()
-             * (sensors not read yet) or with a duty of 0, as error otherwise. */
+             * optics fog up. The held duty applies at once; the logging (once
+             * per episode) waits until the data is missing for
+             * max(HOLD_DEBOUNCE, 2 x dataInterval + 1 s), so a handover between
+             * dew point sources is not reported. During START_WINDOW after
+             * begin() or auto-on (sensors not read yet) only info. After it an
+             * error (at most once per HOLD_ERROR_INTERVAL against a flapping
+             * sensor, a suppressed one follows when the interval is over) if
+             *  - the port regulated since begin() / auto-on and lost its data,
+             *  - the heater runs at a held duty without a probe ever read,
+             *  - the port has a probe but did not regulate within SETUP_WINDOW
+             *    (dew point source not connected),
+             * else info (no probe, or a dew point still expected). */
             static constexpr std::chrono::seconds DUTY_AVERAGE_TIME{300};
             static constexpr std::chrono::seconds START_WINDOW = SENSOR_GRACE_PERIOD;
+            static constexpr std::chrono::seconds SETUP_WINDOW{300};
+            static constexpr std::chrono::seconds HOLD_DEBOUNCE{5};
+            static constexpr std::chrono::seconds HOLD_ERROR_INTERVAL{600};
+            /* What was logged in the current episode */
+            enum class HoldLog : uint8_t { Nothing, Waiting, Info, Error };
+            void restartWindows_(std::chrono::steady_clock::time_point now);
             float avg_duty_;
             std::chrono::steady_clock::time_point avg_time_;
             bool holding_;
-            bool hold_error_logged_;
+            bool in_use_;       // regulated (probe and dew point valid) since begin() / auto-on
+            bool probe_seen_;   // probe read a valid temperature since begin() / auto-on
+            HoldLog hold_logged_;
+            ErrorThrottle hold_error_{HOLD_ERROR_INTERVAL};
+            std::chrono::steady_clock::time_point hold_since_;
             std::chrono::steady_clock::time_point start_window_end_;
+            std::chrono::steady_clock::time_point setup_window_end_;
 
             /* Runaway warning (no limit): heater switched on with a regulated
              * duty >= RUNAWAY_DUTY, and the probe gets less than RUNAWAY_RISE_K

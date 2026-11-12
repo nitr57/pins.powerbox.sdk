@@ -72,8 +72,8 @@ namespace PowerBox
         this->gpio_->begin();
 
         /* Initialize buzzer PWM on GPIO19 (pwmchip0, channel 1) */
-        this->buzzer_ = new PWM("pwmchip0", 1);
-        this->buzzer_->setExport();
+        this->buzzer_ = new Buzzer("pwmchip0", 1);
+        this->buzzer_->begin();
 
         /* Apply bootstrap states */
         for (int i = 0; i < ASIAIR_NUM_POWER_PORTS; ++i)
@@ -292,37 +292,8 @@ namespace PowerBox
 
     PB_ERROR_TYPE ASIAirDevice::Beep(int volume, int duration_ms)
     {
-        if (!this->buzzer_ || duration_ms <= 0)
-        {
-            return PB_ERROR_INVALID_PARAMETER;
-        }
-
-        // Clamp volume to 0-100 range
-        volume = (volume < 0) ? 0 : (volume > 100) ? 100 : volume;
-
-        // If volume is 0, no beep
-        if (volume == 0)
-        {
-            return PB_SUCCESS;
-        }
-
-        // Use 2700 Hz as on the PinsBox buzzer
-        const unsigned int BUZZER_FREQ_HZ = 2700;
-        const unsigned int PERIOD_NS = 1000000000 / BUZZER_FREQ_HZ;
-
-        if (this->buzzer_->getPeriod() != PERIOD_NS)
-        {
-            this->buzzer_->setPeriod(PERIOD_NS);
-        }
-
-        unsigned int duty_ns = (PERIOD_NS * volume) / 100;
-        this->buzzer_->setDutyCycle(duty_ns);
-
-        this->buzzer_->setState(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
-        this->buzzer_->setState(false);
-
-        return PB_SUCCESS;
+        // Starts the tone and returns at once
+        return this->buzzer_ ? this->buzzer_->beep(volume, duration_ms) : PB_ERROR_NOT_AVAILABLE;
     }
 
     static bool IsRPI(void)

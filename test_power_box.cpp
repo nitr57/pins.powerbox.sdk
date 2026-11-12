@@ -28,6 +28,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <algorithm>
+#include <chrono>
+#include <thread>
 
 void PrintMenu()
 {
@@ -1341,6 +1344,8 @@ int main(int argc, char *argv[])
                 PB_ERROR_TYPE error = PBBeep(deviceId, volume, duration);
                 if (error == PB_SUCCESS)
                 {
+                    // PBBeep returns at once: wait for the tone (at most 10 s)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(std::min(std::max(duration, 0), 10000)));
                     printf("[OK] Buzzer test completed successfully\n");
                 }
                 else
