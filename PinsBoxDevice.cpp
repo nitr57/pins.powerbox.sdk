@@ -39,6 +39,8 @@
 #include <chrono>
 #include <thread>
 #include <string>
+#include <atomic>
+#include <cctype>
 #include <json/json.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -174,6 +176,304 @@ namespace PowerBox
         }
     }
 
+    /* ------------------------------------------------------------------------
+     * config.txt boot GPIO check (APO.Mate.5 / CM5 PinsBox)
+     * The firmware applies "gpio=<pins>=<options>" before Linux starts. A switch
+     * line driven high there switches ports / the buck converter / the buzzer on
+     * until the SDK starts. Grammar (Raspberry Pi docs, config.txt "gpio"):
+     *   pins: N, A-B or a comma list of both; options: ip, op, a0-a9, dh, dl,
+     *   pu, pd, pn, np; lines are applied in order (later lines override earlier
+     *   ones, only the attributes they name); conditional filters apply;
+     *   "include <file>" inserts another file of the boot partition.
+     * Conservative: a model filter for another board disables the following
+     * lines, every non-model filter (EDID, HDMI, gpio, serial, tryboot ...) is
+     * treated as true. Read errors are silent (debug only).
+     * ------------------------------------------------------------------------ */
+    static const char *BOOT_CONFIG_DIR = "/boot/firmware";
+    static const char *BOOT_CONFIG_FILE = "config.txt";
+    static const char *BOOT_GPIO_RECOMMENDED = "gpio=2,3,4,12,13,16,18,20-27=op,dl";
+
+    // DSEL, DEN12_ADJ, EN_BUCK, dew gates 12/13, buzzer 16, PWM gate 18, USB_EN1-8
+    static constexpr uint64_t BOOT_LOW_PINS =
+        (1ull << 2) | (1ull << 3) | (1ull << 4) | (1ull << 12) | (1ull << 13) |
+        (1ull << 16) | (1ull << 18) | (0xFFull << 20);
+
+    struct BootGpioState
+    {
+        uint64_t output = 0;   // last direction attribute was "op"
+        uint64_t high = 0;     // last level attribute was "dh"
+        bool active = true;    // current conditional filter state
+        bool fileRead = false; // main file read
+        int files = 0;         // files opened (includes can fan out)
+    };
+
+    static std::string TrimCopy(const std::string &s)
+    {
+        const char *ws = " \t\r\n";
+        size_t b = s.find_first_not_of(ws);
+        if(b == std::string::npos)
+        {
+            return "";
+        }
+        size_t e = s.find_last_not_of(ws);
+        return s.substr(b, e - b + 1);
+    }
+
+    static std::string LowerNoSpace(const std::string &s)
+    {
+        std::string out;
+        for(char c : s)
+        {
+            if(c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            {
+                out += (char)std::tolower((unsigned char)c);
+            }
+        }
+        return out;
+    }
+
+    static bool ParseBootPinNumber(const std::string &s, unsigned &pin)
+    {
+        if(s.empty() || s.size() > 2 || !std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        {
+            return false;
+        }
+        pin = (unsigned)std::stoul(s);
+        return pin < 64;
+    }
+
+    // "3", "18-27", "18-27,3,4" -> mask; false (line ignored) if malformed
+    static bool ParseBootPinList(const std::string &list, uint64_t &mask)
+    {
+        mask = 0;
+        size_t start = 0;
+        while(start <= list.size())
+        {
+            size_t comma = list.find(',', start);
+            std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t dash = item.find('-');
+            unsigned a, b;
+            if(dash == std::string::npos)
+            {
+                if(!ParseBootPinNumber(item, a))
+                {
+                    return false;
+                }
+                b = a;
+            }
+            else if(!ParseBootPinNumber(item.substr(0, dash), a) || !ParseBootPinNumber(item.substr(dash + 1), b) || b < a)
+            {
+                return false;
+            }
+            for(unsigned p = a; p <= b; ++p)
+            {
+                mask |= 1ull << p;
+            }
+            if(comma == std::string::npos)
+            {
+                break;
+            }
+            start = comma + 1;
+        }
+        return true;
+    }
+
+    // One "[...]" filter. The SDK only runs on a CM5 (ScanPinsBox).
+    static void ApplyBootFilter(const std::string &filter, BootGpioState &st)
+    {
+        static const char *OTHER_MODELS[] = {
+            "pi0", "pi0w", "pi02", "pi1", "pi2", "pi3", "pi3+", "pi4", "pi400",
+            "pi500", "pi500+", "cm1", "cm3", "cm3+", "cm4", "cm4s", "none" };
+
+        if(filter == "all" || filter == "cm5" || filter == "pi5")
+        {
+            st.active = true;   // [all] resets every filter; cm5/pi5 match this board
+            return;
+        }
+        for(const char *m : OTHER_MODELS)
+        {
+            if(filter == m)
+            {
+                st.active = false;
+                return;
+            }
+        }
+        // Other filter types (EDID, HDMI, gpioN, serial, tryboot, ...): unknown
+        // here, combined with the model filter (AND) -> active state unchanged
+    }
+
+    static constexpr off_t BOOT_CONFIG_MAX_SIZE = 1024 * 1024;
+
+    static void ParseBootConfigFile(const std::string &dir, const std::string &path, int depth, BootGpioState &st)
+    {
+        // Depth limits the nesting, this the total (many include lines per file)
+        if(++st.files > 16)
+        {
+            return;
+        }
+
+        // Only regular files of a sane size (no FIFO / device that could block
+        // or grow without limit: this runs in the device setup under the SDK lock)
+        struct stat sb;
+        if(stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size > BOOT_CONFIG_MAX_SIZE)
+        {
+            PB_DEBUG("PinsBox: %s not read (missing, not a regular file or too large)", path.c_str());
+            return;
+        }
+        std::ifstream ifs(path);
+        if(!ifs.is_open())
+        {
+            PB_DEBUG("PinsBox: %s not readable", path.c_str());
+            return;
+        }
+        if(depth == 0)
+        {
+            st.fileRead = true;
+        }
+
+        std::string raw;
+        int lines = 0;
+        while(std::getline(ifs, raw) && ++lines <= 10000)
+        {
+            // Comments (also trailing ones: '#' is never part of a gpio line), CR, blanks
+            std::string line = TrimCopy(raw.substr(0, raw.find('#')));
+            if(line.empty())
+            {
+                continue;
+            }
+
+            if(line[0] == '[')
+            {
+                size_t close = line.find(']');
+                if(close != std::string::npos)
+                {
+                    ApplyBootFilter(LowerNoSpace(line.substr(1, close - 1)), st);
+                }
+                continue;
+            }
+
+            if(!st.active)
+            {
+                continue;
+            }
+
+            // include <file> (relative to the boot partition)
+            // (stays on the boot partition: a leading '/' is its root, ".." is not followed)
+            std::string key = LowerNoSpace(line.substr(0, 8));
+            if(key == "include" && line.size() > 8 && (line[7] == ' ' || line[7] == '\t'))
+            {
+                std::string inc = TrimCopy(line.substr(8));
+                while(!inc.empty() && inc[0] == '/')
+                {
+                    inc.erase(0, 1);
+                }
+                if(!inc.empty() && depth < 4 && inc.find("..") == std::string::npos)
+                {
+                    ParseBootConfigFile(dir, dir + "/" + inc, depth + 1, st);
+                }
+                continue;
+            }
+
+            std::string compact = LowerNoSpace(line);
+            if(compact.compare(0, 5, "gpio=") != 0)
+            {
+                continue;
+            }
+            std::string value = compact.substr(5);
+            size_t eq = value.find('=');
+            uint64_t pins;
+            if(eq == std::string::npos || !ParseBootPinList(value.substr(0, eq), pins))
+            {
+                continue;
+            }
+
+            // Attributes in order, each one changes only its own property
+            std::string opts = value.substr(eq + 1);
+            size_t start = 0;
+            while(start <= opts.size())
+            {
+                size_t comma = opts.find(',', start);
+                std::string o = opts.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if(o == "op")
+                {
+                    st.output |= pins;
+                }
+                else if(o == "ip" || (o.size() == 2 && o[0] == 'a' && o[1] >= '0' && o[1] <= '9'))
+                {
+                    st.output &= ~pins;
+                }
+                else if(o == "dh")
+                {
+                    st.high |= pins;
+                }
+                else if(o == "dl")
+                {
+                    st.high &= ~pins;
+                }
+                if(comma == std::string::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+        }
+    }
+
+    // "3,4,12,13,16,18,20-27"
+    static std::string FormatPinMask(uint64_t mask)
+    {
+        std::string out;
+        for(unsigned p = 0; p < 64; ++p)
+        {
+            if(!(mask & (1ull << p)))
+            {
+                continue;
+            }
+            unsigned e = p;
+            while(e + 1 < 64 && (mask & (1ull << (e + 1))))
+            {
+                ++e;
+            }
+            if(!out.empty())
+            {
+                out += ",";
+            }
+            out += std::to_string(p);
+            if(e >= p + 2)
+            {
+                out += "-" + std::to_string(e);   // ranges from 3 pins on
+                p = e;
+            }
+        }
+        return out;
+    }
+
+    /* Once per process (the config is persistent: each N.I.N.A. session log
+     * shows it) */
+    static void CheckBootGpioConfig(void)
+    {
+        static std::atomic<bool> done{false};
+        if(done.exchange(true))
+        {
+            return;
+        }
+
+        BootGpioState st;
+        ParseBootConfigFile(BOOT_CONFIG_DIR, std::string(BOOT_CONFIG_DIR) + "/" + BOOT_CONFIG_FILE, 0, st);
+        const uint64_t cfgHigh = st.output & st.high & BOOT_LOW_PINS;
+
+        if(cfgHigh)
+        {
+            PB_ERROR("PinsBox: %s/%s drives GPIO %s high at boot (ports, buck converter or buzzer are switched on before the SDK starts); "
+                     "recommended: %s (replace the old gpio= line, then reboot)",
+                     BOOT_CONFIG_DIR, BOOT_CONFIG_FILE, FormatPinMask(cfgHigh).c_str(), BOOT_GPIO_RECOMMENDED);
+        }
+        else if(!st.fileRead)
+        {
+            PB_DEBUG("PinsBox: boot GPIO check skipped (config.txt not readable)");
+        }
+    }
+
     /* Lock file of the PinsBox hardware (world writable tmpfs) */
     static const char *LOCK_FILE = "/run/lock/pinsbox.lock";
 
@@ -301,6 +601,11 @@ namespace PowerBox
         // keep an already configured output level, the 1-wire pins idle high,
         // all other lines (sense enables, DSEL) start low.
         const bool gpioOk = this->gpio_->begin(sameBoot, PINS, 19, DS18_PINS, 2);
+
+        // config.txt boot levels of the switch lines (once per process; also when
+        // the GPIO setup failed, a config driving the lines may be the reason)
+        CheckBootGpioConfig();
+
         if(!gpioOk)
         {
             // GPIO lines busy (another process, an overlay) or not readable, or the
