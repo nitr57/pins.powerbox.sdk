@@ -96,12 +96,14 @@ namespace PowerBox
     /*
      * Hardware quirk: the BTS7006 supply DEN is wired to DSEL (GPIO26). While a
      * "sel 1" port is measured (DSEL driven high) the BTS7006 sense also drives
-     * the shared IS line, so those ports read high. Correct each one by
-     * subtracting the supply's scaled contribution:
-     *   I_port = reported - I_supply * (kILIS_port / kILIS_supply)
+     * the shared IS line, so those ports read high. The supply's sense voltage
+     * (I_supply / kILIS_supply * 1.2 kOhm) is subtracted inside the port's
+     * measurement, before its over current check (BTS7XXX_::setSenseOffset).
      */
-    static constexpr float CORR_7012 = KILIS_BTS7012 / KILIS_BTS7006;
     static constexpr float CORR_7080 = KILIS_BTS7080 / KILIS_BTS7006;
+
+    /* Sense voltage the supply adds per A of supply current (1.2 kOhm) */
+    static constexpr float SUPPLY_SENSE_mV_PER_A = 1000.f / KILIS_BTS7006 * 1200.f;
 
     /* -------------------------------------------------------------------------
      * PWM signal mapping (sysfs), mirroring PinsBoxDevice:
@@ -155,6 +157,7 @@ namespace PowerBox
         // dedicated diag line, so it is read by driving DSEL high in isolation
         // (diag_pin = sel_pin = DSEL, port = 1, no switch pin).
         this->supply_ = new BTS7006<MCP3202>(*this->gpio_, *this->adc_);
+        this->supply_->setName("Supply");
         this->supply_->begin(1200, DSEL_PIN, 255, DSEL_PIN, 1);
         this->supply_->setMaxCurrent(10.f);
         this->supply_->setChannel(ADC_CH_ISENSE);
@@ -166,6 +169,7 @@ namespace PowerBox
         for(int i = 0; i < PINSBOXMINI_NUM_POWER_PORTS; ++i)
         {
             this->pwr_[i] = new BTS7012<MCP3202>(*this->gpio_, *this->adc_);
+            this->pwr_[i]->setName("12V port " + std::to_string(i));
         }
 
         this->pwr_[0]->begin(1200, DEN_12V_12,   PWR_PINS[0], DSEL_PIN, 0, this->powerBootstrap[0]);
@@ -179,6 +183,10 @@ namespace PowerBox
             this->pwr_[i]->setSampling(10, 1);
             this->powerReadOnly[i] = false;
         }
+
+        // 12V #2 (sel 1) is corrected by the mean supply sense: sample it over the
+        // same span (several 400 Hz periods of the dew heaters in the supply)
+        this->pwr_[1]->setSampling(100, 50);
 
         // USB ports are read-only / non-controllable and always on
         for(int i = 0; i < PINSBOXMINI_NUM_USB_PORTS; ++i)
@@ -675,6 +683,15 @@ namespace PowerBox
             this->supply12V = this->adc_->analogReadAverage(ADC_CH_12V, 20, 0) * (SUPPLY_R1 + SUPPLY_R2) / SUPPLY_R2 * 0.001f;
         }
 
+        // The "sel 1" ports (12V #2 = pwr_[1], dew #2 = dew_[1], PWM port) read the
+        // supply sense in addition (its DEN is wired to DSEL): subtracted inside the
+        // measurement, before the over current check. Dew #2 sees its own current
+        // in the supply sense as well while on (coupling).
+        const float supplyOffset_mV = this->supply12A * SUPPLY_SENSE_mV_PER_A;
+        this->pwr_[1]->setSenseOffset(supplyOffset_mV);
+        this->dew_[1]->setSenseOffset(supplyOffset_mV, CORR_7080);
+        this->pwm_->setSenseOffset(supplyOffset_mV);
+
         // 12V power ports
         for(int i = 0; i < PINSBOXMINI_NUM_POWER_PORTS; ++i)
         {
@@ -706,13 +723,6 @@ namespace PowerBox
             this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
             this->pwmState = this->pwm_->getState();
         }
-
-        // Correct the "sel 1" ports for the mis-wired BTS7006 sense bleeding onto
-        // the shared IS line while DSEL is high: 12V #2 (pwr_[1], BTS7012), the
-        // PWM port (BTS7012) and dew #2 (dew_[1], BTS7080).
-        this->powerCurrent[1] = std::max(0.f, this->powerCurrent[1] - this->supply12A * CORR_7012);
-        this->pwmCurrent      = std::max(0.f, this->pwmCurrent      - this->supply12A * CORR_7012);
-        this->dewCurrent[1]   = std::max(0.f, this->dewCurrent[1]   - this->supply12A * CORR_7080);
 
         // Accumulate energy using actual elapsed time
         auto now = std::chrono::steady_clock::now();
@@ -825,13 +835,21 @@ namespace PowerBox
 
         this->dew_[i]->setState(state, power);
 
-        // Report what the hardware really does
+        // Report what the hardware really does; switching clears the over
+        // current flag: show it in the status at once
         this->dewState[i] = this->dew_[i]->getState();
         this->dewPWM[i] = this->dew_[i]->getDutyCycle();
+        this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
 
         if (state != 0 && this->dewState[i] == 0)
         {
             PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state != 0 && this->dewOvercurrent[i] != 0)
+        {
+            // A failed over current shutdown is pending: the request was rejected
+            // (normally logged by the port), the heater stays at duty 0
             return false;
         }
         if (state == 0 && this->dewState[i] != 0)
@@ -853,6 +871,9 @@ namespace PowerBox
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dewAuto[i] = state;
             this->dew_[i]->setAutoMode(state);
+            // Auto mode on clears the over current flag: show it at once
+            this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
+            this->dewState[i] = this->dew_[i]->getState();
             if (state && !this->dew_[i]->isPwmOk())
             {
                 // No error return: the rest of the dew configuration must still be applied
@@ -888,13 +909,21 @@ namespace PowerBox
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
 
-        // Report what the hardware really does (power is not range checked)
+        // Report what the hardware really does (power is not range checked);
+        // switching clears the over current flag: show it at once
         this->pwmState = this->pwm_->getState();
         this->pwmPWM = this->pwm_->getDutyCycle();
+        this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
 
         if (state != 0 && this->pwmState == 0)
         {
             PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state != 0 && this->pwmOvercurrent != 0)
+        {
+            // A failed over current shutdown is pending: the request was rejected
+            // (normally logged by the port), the output stays at duty 0
             return false;
         }
         if (state == 0 && this->pwmState != 0)

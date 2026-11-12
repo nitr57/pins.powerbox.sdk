@@ -114,6 +114,8 @@ namespace PowerBox
             int voltage_supply_;
             bool over_voltage_;
             bool boot_target_invalid_;
+            bool oc_parked_ = false;   // DAC parked after a failed over current shutdown
+            ErrorThrottle oc_park_error_;
 
             const BTS7006<MCP3204>* supply_;
 
@@ -160,7 +162,11 @@ namespace PowerBox
             void toggle(void) { this->bts_->toggle(); }
             void setState(uint8_t state, uint8_t dc);
 
-            void measureCurrent(void) { this->bts_->measureCurrent(); }
+            /* The load current is chopped by the low-side PWM (30 kHz): the over
+             * current check estimates the current while on from mean / duty */
+            void measureCurrent(void);
+            /* See BTS7XXX_::setSenseOffset (PinsBox Mini) */
+            void setSenseOffset(float offset_mV, float coupling = 0.f) { this->bts_->setSenseOffset(offset_mV, coupling); }
 
             uint16_t getCurrent_mA(void) const { return this->bts_->getCurrent_mA(); }
             uint8_t getState(void) const { return this->bts_->getState(); }

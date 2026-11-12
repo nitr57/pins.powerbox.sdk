@@ -325,6 +325,7 @@ namespace PowerBox
 
         // Supply
         this->supply_ = new BTS7006<MCP3204>(*this->gpio_, *this->adc_);
+        this->supply_->setName("Supply");
         this->supply_->begin(1200, INDEN_PIN, 255, DSEL_PIN, 0);
         this->supply_->setMaxCurrent(12.f);
         this->supply_->setChannel(2);
@@ -335,6 +336,7 @@ namespace PowerBox
         for(int i = 0; i < PINSBOX_NUM_POWER_PORTS; ++i)
         {
             this->pwr_[i] = new BTS7012<MCP3204>(*this->gpio_, *this->adc_);
+            this->pwr_[i]->setName("12V port " + std::to_string(i));
         }
 
         // Port 0 is readonly
@@ -1194,13 +1196,21 @@ namespace PowerBox
 
         this->dew_[i]->setState(state, power);
 
-        // Report what the hardware really does
+        // Report what the hardware really does; switching clears the over
+        // current flag: show it in the status at once
         this->dewState[i] = this->dew_[i]->getState();
         this->dewPWM[i] = this->dew_[i]->getDutyCycle();
+        this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
 
         if (state != 0 && this->dewState[i] == 0)
         {
             PB_ERROR("Dew port %d: could not be switched on%s", i, this->dew_[i]->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state != 0 && this->dewOvercurrent[i] != 0)
+        {
+            // A failed over current shutdown is pending: the request was rejected
+            // (normally logged by the port), the heater stays at duty 0
             return false;
         }
         if (state == 0 && this->dewState[i] != 0)
@@ -1218,6 +1228,9 @@ namespace PowerBox
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             this->dewAuto[i] = state;
             this->dew_[i]->setAutoMode(state);
+            // Auto mode on clears the over current flag: show it at once
+            this->dewOvercurrent[i] = this->dew_[i]->getOverCurrent() ? 1 : 0;
+            this->dewState[i] = this->dew_[i]->getState();
             if (state && !this->dew_[i]->isPwmOk())
             {
                 // No error return: the rest of the dew configuration must still be applied
@@ -1252,6 +1265,8 @@ namespace PowerBox
             std::lock_guard<std::mutex> lock(this->hwMutex_);
             ok = this->buck_->setState(state != 0, target);
             this->buckState = this->buck_->getState();
+            // Switching clears the over current flag: show it at once
+            this->buckOvercurrent = this->buck_->getOverCurrent() ? 1 : 0;
             // Report and persist the target the port really uses, a rejected
             // target must not be applied again at the next boot
             this->buckVset = this->buck_->getTargetVoltage();
@@ -1282,13 +1297,21 @@ namespace PowerBox
         std::lock_guard<std::mutex> lock(this->hwMutex_);
         this->pwm_->setState(state, power);
 
-        // Report what the hardware really does (power is not range checked)
+        // Report what the hardware really does (power is not range checked);
+        // switching clears the over current flag: show it at once
         this->pwmState = this->pwm_->getState();
         this->pwmPWM = this->pwm_->getDutyCycle();
+        this->pwmOvercurrent = this->pwm_->getOverCurrent() ? 1 : 0;
 
         if (state != 0 && this->pwmState == 0)
         {
             PB_ERROR("PWM port: could not be switched on%s", this->pwm_->isPwmOk() ? "" : " (PWM not initialized)");
+            return false;
+        }
+        if (state != 0 && this->pwmOvercurrent != 0)
+        {
+            // A failed over current shutdown is pending: the request was rejected
+            // (normally logged by the port), the output stays at duty 0
             return false;
         }
         if (state == 0 && this->pwmState != 0)

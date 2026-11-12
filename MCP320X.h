@@ -26,11 +26,25 @@
 #define MCP320X_H
 
 #include <stdint.h>
+#include "ErrorThrottle.h"
 
 namespace PowerBox
 {
     class SPIBus;
     class GPIOManager;
+
+    /* Statistics of a burst of samples of one channel, for a current sense that
+     * may be chopped by a PWM (on-phase / off-phase) */
+    struct SenseStats
+    {
+        int n = 0;              // samples taken
+        float mean_mV = 0.f;    // mean of all samples
+        float min_mV = 0.f;
+        float max_mV = 0.f;
+        float on_mV = 0.f;      // median of the upper cluster (split at (min + max) / 2)
+        int on_count = 0;       // samples in the upper cluster; 0 without a clear on/off structure
+        int saturated = 0;      // samples at >= 95 % of the full scale
+    };
 
     template <uint8_t NCH, uint8_t BIT>
     class MCP320X_
@@ -44,13 +58,23 @@ namespace PowerBox
 
             uint16_t analogRead(uint8_t ch) const;
             uint16_t analogReadAverage(uint8_t ch, uint8_t n, uint16_t delay = 0) const;
+            /* n samples (at most 255) with delay_us between them */
+            void analogReadStats(uint8_t ch, uint8_t n, uint16_t delay_us, SenseStats& stats) const;
+            float getFullScale_mV(void) const { return this->v_ref_ * 1e3f; }
+            /* Log throttle of the shared sense line of this ADC (one stuck sense
+             * output blocks it for all ports; used under the device's lock) */
+            ErrorThrottle& senseBusThrottle(void) const { return this->sense_bus_throttle_; }
 
         private:
+            /* Minimum spread (raw counts, ~10 mV) for an on/off structure */
+            static constexpr uint16_t SPREAD_MIN = 12;
+
             SPIBus* spi_;
             const GPIOManager* gpio_;
             uint8_t init_;
 
             float v_ref_;
+            mutable ErrorThrottle sense_bus_throttle_;
     };
 
     using MCP3202 = MCP320X_<2, 12>;

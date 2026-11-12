@@ -143,6 +143,7 @@ namespace PowerBox
 
         // Supply
         this->supply_ = new BTS7006<MCP3202>(*this->gpio_, *this->adc_);
+        this->supply_->setName("Supply");
         this->supply_->begin(1200, hw.supply_inden_pin, 255, hw.supply_dsel_pin, 0);
         this->supply_->setMaxCurrent(12.f);
         this->supply_->setChannel(0);
@@ -153,6 +154,7 @@ namespace PowerBox
         {
             const PinsBoxLightPowerPortConfig& pc = hw.power_ports[i];
             this->pwr_[i] = MakeBTSPort(pc.chip, *this->gpio_, *this->adc_);
+            this->pwr_[i]->setName("12V port " + std::to_string(i));
             this->pwr_[i]->begin(pc.rsense, pc.den_pin, pc.pwr_pin, pc.dsel_pin, pc.dsel_port, this->powerBootstrap[i]);
             this->pwr_[i]->setMaxCurrent(pc.max_current);
             this->pwr_[i]->setChannel(pc.adc_channel);

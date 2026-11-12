@@ -93,6 +93,7 @@ namespace PowerBox
             }
         }
 
+        this->bts_->setName("Dew port " + std::to_string(this->port_));
         this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, keep ? keptIn : 0);
         this->bts_->setMaxCurrent(3.f);
         this->bts_->setChannel(adc_ch);
@@ -302,8 +303,30 @@ namespace PowerBox
             this->avg_time_ = now;
         }
 
-        // Measure properties
-        this->bts_->measureCurrent();
+        // Measure properties. The heater current is chopped by the low-side PWM
+        // (400 Hz): the over current check uses the current while on
+        this->bts_->measureCurrent(this->appliedDuty_(), SenseMode::ON_PHASE);
+
+        // Over current, but the switch-off failed (retried every measurement):
+        // stop the low-side PWM, so no current flows through the heater
+        if(this->bts_->getOverCurrent() && this->bts_->getState() && this->pwm_ok_)
+        {
+            this->pwm_->setDutyCycle(0);
+            this->pwm_->setState(0);
+        }
+    }
+
+    template <typename MCP>
+    float DewPortT<MCP>::appliedDuty_(void) const
+    {
+        if(!this->pwm_ok_ || this->pwm_->getState() != 1)
+        {
+            return 0.f;
+        }
+
+        unsigned int period = this->pwm_->getPeriod();
+        unsigned int dutyCycle_ns = this->pwm_->getDutyCycle();
+        return period > 0 ? std::min(1.f, (float)dutyCycle_ns / period) : 0.f;
     }
 
     template <typename MCP>
@@ -427,6 +450,23 @@ namespace PowerBox
             {
                 return;
             }
+        }
+
+        // A failed over current shutdown keeps the switch on: no new duty, the PWM
+        // stays stopped; switching off is still tried
+        if(this->bts_->getOverCurrent() && this->bts_->getState())
+        {
+            this->pwm_->setDutyCycle(0);
+            this->pwm_->setState(0);
+            if(!state)
+            {
+                this->bts_->setState(0);
+            }
+            else
+            {
+                PB_ERROR("Dew port %u: over current shutdown pending, request rejected", this->port_);
+            }
+            return;
         }
 
         // Convert duty cycle to nano seconds

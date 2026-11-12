@@ -121,6 +121,23 @@ extern "C"
         float wattHours;                             /* Watt hours [Wh] */
     } PB_SUPPLY_STATUS;
 
+    /* Over current of the PinsBox / Mini / Light 12 V, dew, buck and PWM ports
+     * (software, PROFET sense, measured about once per second): a port is
+     * switched off and its overcurrent flag set if its current is above its
+     * limit in 2 measurements in a row, or at once at 1.5 x the limit, at the
+     * end of the measuring range in (almost) all samples (BTS fault); not at
+     * once in the first measurement after switching on. Dew and PWM ports are
+     * chopped by a low-side PWM: their limit applies to the current while on
+     * (dew: on-phase level of the samples; PWM port: mean / duty with the duty
+     * at least 20 %, averaged over about 5 s); current[] is the mean. The +
+     * output of these ports is always live, a short to ground is detected at
+     * any duty. Switching the port on clears the flag (dew in auto mode:
+     * switching auto mode on); switching does not reset the count of
+     * measurements above the limit, it expires 10 s after the last one. A port
+     * without a switch (12 V port 0 of the PinsBox, supply) shows the real
+     * current and sets the flag by the same rule while it applies, without a
+     * shutdown. A measurement is skipped (the last current is kept) while the
+     * shared sense line is not idle before it (another sense output on). */
     typedef struct _PB_POWER_PORT_STATUS
     {
         int numPorts;                               /* Number of ports */
@@ -147,7 +164,7 @@ extern "C"
     {
         int numPorts;                               /* Number of ports */
         int pwmResolution;                          /* PWM resolution (bit depth); 0 = no dew port */
-        float current[PB_MAX_DEW_PORTS];            /* Current draw [A] */
+        float current[PB_MAX_DEW_PORTS];            /* Current draw [A], mean over the PWM */
         int overcurrent[PB_MAX_DEW_PORTS];          /* Overcurrent flag */
         float probe[PB_MAX_DEW_PORTS];              /* Probe temperature [°C], -127 = no valid value */
         int pwm[PB_MAX_DEW_PORTS];                  /* PWM value, raw (0 to 2^pwmResolution-1), not [%] */
@@ -170,7 +187,7 @@ extern "C"
     {
         int numPorts;                                /* Number of ports */
         int pwmResolution;                           /* PWM resolution (bit depth); 0 = no PWM port */
-        float current;                               /* Current draw [A] */
+        float current;                               /* Current draw [A], mean over the PWM */
         int overcurrent;                             /* Overcurrent flag */
         int pwm;                                     /* PWM value, raw (0 to 2^pwmResolution-1), not [%] */
         int state;                                   /* Port state (ON/OFF), also reflects over current shutdowns */

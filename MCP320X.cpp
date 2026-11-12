@@ -30,6 +30,7 @@
 #include <chrono>
 #include <vector>
 #include <iostream>
+#include <algorithm>
 
 namespace PowerBox
 {
@@ -106,6 +107,11 @@ namespace PowerBox
     template <uint8_t NCH, uint8_t BIT>
     uint16_t MCP320X_<NCH, BIT>::analogReadAverage(uint8_t ch, uint8_t n, uint16_t delay_us) const
     {
+        if(n == 0)
+        {
+            return 0;
+        }
+
         float adc = 0.f;
 
         for(uint8_t i = 0; i < n; ++i)
@@ -123,6 +129,71 @@ namespace PowerBox
         // Convert it back to the analog value using digital range
         // and reference voltage
         return adc;
+    }
+
+    template <uint8_t NCH, uint8_t BIT>
+    void MCP320X_<NCH, BIT>::analogReadStats(uint8_t ch, uint8_t n, uint16_t delay_us, SenseStats& stats) const
+    {
+        stats = SenseStats();
+        if(n == 0)
+        {
+            return;
+        }
+
+        uint16_t raw[255];
+        uint32_t sum = 0;
+        uint16_t lo = 0xFFFF;
+        uint16_t hi = 0;
+        for(uint8_t i = 0; i < n; ++i)
+        {
+            raw[i] = this->analogRead(ch);
+            sum += raw[i];
+            lo = std::min(lo, raw[i]);
+            hi = std::max(hi, raw[i]);
+            if(delay_us > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            }
+        }
+
+        const uint16_t full = (1 << BIT) - 1;
+        const uint16_t satLevel = (uint16_t)(full * 95 / 100);
+        const float mV = this->v_ref_ * 1e3f / (1 << BIT);
+
+        stats.n = n;
+        stats.mean_mV = (float)sum / n * mV;
+        stats.min_mV = lo * mV;
+        stats.max_mV = hi * mV;
+
+        // Upper cluster (on-phase of a chopped current), only with a clear spread
+        // above the noise. Its median, so that a single spike does not set it.
+        uint16_t upper[255];
+        int nUpper = 0;
+        if(hi - lo >= SPREAD_MIN)
+        {
+            uint16_t split = (uint16_t)((lo + hi) / 2);
+            for(uint8_t i = 0; i < n; ++i)
+            {
+                if(raw[i] > split)
+                {
+                    upper[nUpper++] = raw[i];
+                }
+            }
+        }
+        if(nUpper > 0)
+        {
+            std::nth_element(upper, upper + nUpper / 2, upper + nUpper);
+            stats.on_mV = upper[nUpper / 2] * mV;
+            stats.on_count = nUpper;
+        }
+
+        for(uint8_t i = 0; i < n; ++i)
+        {
+            if(raw[i] >= satLevel)
+            {
+                ++stats.saturated;
+            }
+        }
     }
 
     template class MCP320X_<2, 12>;

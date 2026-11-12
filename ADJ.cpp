@@ -58,6 +58,7 @@ namespace PowerBox
         // A converter that is still running (taken over) keeps its enable line,
         // otherwise the enable pin is driven low and the converter is off
         bool running = keptEn == 1;
+        this->bts_->setName("Buck");
         this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, running ? 1 : 0);
         this->bts_->setMaxCurrent(3.0f);
         this->bts_->setChannel(2);
@@ -230,6 +231,9 @@ namespace PowerBox
         // DAC first, then switch on. If the DAC does not hold the target,
         // the output voltage would differ from the requested one.
         // setState(1) is a no-op if the port is already on.
+        // A new switch-on: a later failed over current shutdown parks again
+        this->oc_parked_ = false;
+        this->oc_park_error_.succeed();
         if (!this->setVoltage_(target) || !this->bts_->setState(1))
         {
             // The output voltage is not the requested one: switch off, even if
@@ -261,6 +265,29 @@ namespace PowerBox
         if (wasOn && !this->bts_->getState())
         {
             this->parkDac_();
+        }
+        // Over current, but the shutdown failed (retried every measurement): drop
+        // the output to the minimum as emergency measure, like setState(0) does
+        else if (this->bts_->getOverCurrent() && this->bts_->getState())
+        {
+            if (!this->oc_parked_)
+            {
+                this->oc_parked_ = this->parkDac_();
+                if (this->oc_parked_)
+                {
+                    PB_ERROR("Buck: over current shutdown failed, output set to the minimum voltage");
+                }
+                else if (this->oc_park_error_.fail())
+                {
+                    PB_ERROR("Buck: over current shutdown failed and the output could not be set to the minimum voltage (%u times)",
+                             this->oc_park_error_.failures());
+                }
+            }
+        }
+
+        if (!this->bts_->getOverCurrent())
+        {
+            this->oc_parked_ = false;
         }
     }
 
@@ -406,10 +433,13 @@ namespace PowerBox
             }
         }
 
+        this->bts_->setName("PWM port");
         this->bts_->begin(1200, diag_pin, pwr_pin, sel_pin, port, this->taken_over_ ? keptIn : 0);
         this->bts_->setMaxCurrent(maxCurrent);
         this->bts_->setChannel(adc_ch);
-        this->bts_->setSampling(100, 50);
+        // 30 kHz chopped current: many samples at random phase for the mean (the
+        // estimate mean / duty amplifies its noise); about 25-30 ms under the lock
+        this->bts_->setSampling(255, 20);
 
         if(this->taken_over_)
         {
@@ -503,6 +533,23 @@ namespace PowerBox
             dc = 0;
         }
 
+        // A failed over current shutdown keeps the switch on: no new duty, the PWM
+        // stays stopped; switching off is still tried
+        if(this->bts_->getOverCurrent() && this->bts_->getState())
+        {
+            this->pwm_->setDutyCycle(0);
+            this->pwm_->setState(0);
+            if(!state)
+            {
+                this->bts_->setState(0);
+            }
+            else
+            {
+                PB_ERROR("PWM port: over current shutdown pending, request rejected");
+            }
+            return;
+        }
+
         // Convert duty cycle to nano seconds
         unsigned int period = this->pwm_->getPeriod();
         unsigned int dutyCycle = (unsigned int)(((uint64_t)period * dc) / 255);
@@ -514,6 +561,29 @@ namespace PowerBox
         this->pwm_->setDutyCycle(dutyCycle);
         this->pwm_->setState(dutyCycle != 0);
         this->bts_->setState(state);
+    }
+
+    template <typename MCP, uint16_t kILIS>
+    void PWMPortT<MCP, kILIS>::measureCurrent(void)
+    {
+        // Duty the PWM channel really applies, 0 if it does not run
+        float duty = 0.f;
+        if(this->pwm_ok_ && this->pwm_->getState() == 1)
+        {
+            unsigned int period = this->pwm_->getPeriod();
+            unsigned int dutyCycle_ns = this->pwm_->getDutyCycle();
+            duty = period > 0 ? std::min(1.f, (float)dutyCycle_ns / period) : 0.f;
+        }
+
+        this->bts_->measureCurrent(duty, SenseMode::PER_DUTY);
+
+        // Over current, but the switch-off failed (retried every measurement):
+        // stop the low-side PWM, so no current flows through the load
+        if(this->bts_->getOverCurrent() && this->bts_->getState() && this->pwm_ok_)
+        {
+            this->pwm_->setDutyCycle(0);
+            this->pwm_->setState(0);
+        }
     }
 
     template <typename MCP, uint16_t kILIS>

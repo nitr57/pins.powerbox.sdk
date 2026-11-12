@@ -66,6 +66,8 @@ namespace PowerBox
             float getTemperature(void) const { return this->probe_->getTemperature(); }
 
             void resetOverCurrent(void) { this->bts_->resetOverCurrent(); }
+            /* See BTS7XXX_::setSenseOffset (PinsBox Mini) */
+            void setSenseOffset(float offset_mV, float coupling = 0.f) { this->bts_->setSenseOffset(offset_mV, coupling); }
 
         private:
             void setState_(uint8_t state, uint8_t dutyCycle);
@@ -94,6 +96,8 @@ namespace PowerBox
             std::chrono::steady_clock::time_point next_retry_;
 
             uint8_t outputDuty_(void) const;
+            /* Duty (0..1) the PWM channel really applies, 0 if it does not run */
+            float appliedDuty_(void) const;
             void checkRunaway_(int dutyCycle, float temperature, std::chrono::steady_clock::time_point now);
 
             /* Auto mode without a valid probe temperature or dew point keeps the
