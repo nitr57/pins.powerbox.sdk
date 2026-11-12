@@ -105,14 +105,6 @@ namespace PowerBox
      */
     void PBLogError(const char *fmt, ...);
 
-    /**
-     * Get current timestamp string for logging.
-     * Optionally includes in log output if PB_TIMESTAMP_ENABLED is true.
-     *
-     * @return Pointer to static timestamp string buffer
-     */
-    const char *PBGetTimestamp();
-
 } /* namespace PowerBox */
 
 #endif /* POWER_BOX_LOGGING_H */

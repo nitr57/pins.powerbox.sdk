@@ -75,6 +75,7 @@ namespace PowerBox
 
             float v_ref_;
             mutable ErrorThrottle sense_bus_throttle_;
+            mutable ErrorThrottle read_error_;
     };
 
     using MCP3202 = MCP320X_<2, 12>;

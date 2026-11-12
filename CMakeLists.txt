@@ -23,7 +23,7 @@
 # ###############################################################################
 
 cmake_minimum_required(VERSION 3.22)
-project(PowerBoxSDK VERSION 1.5.0 DESCRIPTION "PowerBox SDK")
+project(PowerBoxSDK VERSION 1.6.0 DESCRIPTION "PowerBox SDK")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

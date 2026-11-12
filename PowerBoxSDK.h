@@ -329,6 +329,35 @@ extern "C"
         int channel;
     } PB_WIFI_CONFIG;
 
+    /* SDK log messages. Every message is written to stderr (journal) as before;
+     * additionally it is passed to a callback, e.g. to forward it into the log
+     * of the application.
+     * The callback is called from SDK threads (status listener, API calls),
+     * possibly while SDK locks are held: it must return quickly (copy the
+     * message and queue it), must not throw, must not call any SDK function
+     * and must not wait for other threads or the UI. message: UTF-8 (normally ASCII), without
+     * time, level prefix and newline, may be truncated; valid only during the
+     * call. One callback per process (the last one set is used); set it before
+     * the first PBScan to get the messages of the scan. PBSetLogCallback waits
+     * for calls of the previous callback that are still running, at most 1 s.
+     * Unless a call took longer than that, the previous callback is not
+     * running any more and is not called again after it returns. */
+    typedef enum _PB_LOG_LEVEL
+    {
+        PB_LOG_ERROR = 0,
+        PB_LOG_WARNING = 1,                          /* reserved */
+        PB_LOG_INFO = 2,
+        PB_LOG_DEBUG = 3
+    } PB_LOG_LEVEL;
+
+    typedef void (*PB_LOG_CALLBACK)(int level, const char *message);
+
+    PBAPI void PBSetLogCallback(PB_LOG_CALLBACK callback);
+    /* Highest level passed to the callback (default PB_LOG_INFO; clamped).
+     * Does not change the stderr output; messages compiled out of the SDK
+     * (debug) cannot be enabled at runtime. */
+    PBAPI void PBSetLogLevel(int level);
+
     /* Device scanning and management */
     /* Returns PB_ERROR_INVALID_STATE with *number = 0 if a PinsBox is present but
      * not usable (e.g. used by another process, its GPIO / I/O expander could not

@@ -29,7 +29,6 @@
 #include <thread>
 #include <chrono>
 #include <vector>
-#include <iostream>
 #include <algorithm>
 
 namespace PowerBox
@@ -59,7 +58,7 @@ namespace PowerBox
     void MCP320X_<NCH, BIT>::begin(float vRef)
     {
         if (!this->spi_ || !this->spi_->isConnected()) {
-            std::cerr << "Error: SPI bus not available, MCP320X cannot initialize" << std::endl;
+            PB_ERROR("MCP320X: SPI bus not available, no current / voltage measurement");
             this->init_ = false;
             return;
         }
@@ -79,7 +78,10 @@ namespace PowerBox
     uint16_t MCP320X_<NCH, BIT>::analogRead(uint8_t ch) const
     {
         if (!this->init_ || !this->spi_ || !this->spi_->isConnected()) {
-            std::cerr << "Warning: Attempting to read from uninitialized MCP320X" << std::endl;
+            // Every sample of every port would log: rate limited
+            if (this->read_error_.fail()) {
+                PB_ERROR("MCP320X: read without a working SPI bus, the measurements read 0 (%u times)", this->read_error_.failures());
+            }
             return 0;
         }
 

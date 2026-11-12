@@ -25,7 +25,8 @@
 #ifndef SPI_H
 #define SPI_H
 
-#include <iostream>
+#include "ErrorThrottle.h"
+#include "PowerBoxLogging.h"
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -42,12 +43,14 @@ namespace PowerBox
             uint8_t bits = 8;
             uint32_t speed = 1000000; // 1MHz
             bool connected_ = false;
+            // Rate limits the log of failing transfers (each sample is one)
+            ErrorThrottle transfer_error_;
 
         public:
             SPIBus(const char* device) {
                 fd = open(device, O_RDWR);
                 if (fd < 0) {
-                    std::cerr << "Warning: Failed to open SPI device " << device << std::endl;
+                    PB_ERROR("SPI: failed to open %s (dtparam=spi=on in config.txt?)", device);
                     fd = -1;
                     connected_ = false;
                 } else {
@@ -68,7 +71,7 @@ namespace PowerBox
             void begin(uint32_t speed, uint8_t bits, uint8_t mode)
             {
                 if (!connected_) {
-                    std::cerr << "Warning: Attempting to configure disconnected SPI bus" << std::endl;
+                    PB_ERROR("SPI: bus not open, not configured");
                     return;
                 }
 
@@ -78,19 +81,21 @@ namespace PowerBox
 
                 // Set SPI mode, bits per word, and max speed
                 if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0) {
-                    std::cerr << "Warning: Failed to set SPI mode" << std::endl;
+                    PB_ERROR("SPI: failed to set the mode");
                 }
                 if (ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
-                    std::cerr << "Warning: Failed to set SPI bits per word" << std::endl;
+                    PB_ERROR("SPI: failed to set the bits per word");
                 }
                 if (ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
-                    std::cerr << "Warning: Failed to set SPI speed" << std::endl;
+                    PB_ERROR("SPI: failed to set the speed");
                 }
             }
 
             void transfer(const std::vector<uint8_t>& tx, std::vector<uint8_t>& rx) {
                 if (!connected_) {
-                    std::cerr << "Warning: Attempting SPI transfer on disconnected bus" << std::endl;
+                    if (transfer_error_.fail()) {
+                        PB_ERROR("SPI: transfer on a bus that is not open, reads 0 (%u times)", transfer_error_.failures());
+                    }
                     rx.resize(tx.size(), 0);
                     return;
                 }
@@ -108,7 +113,12 @@ namespace PowerBox
                 tr.bits_per_word = bits;
 
                 if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 1) {
-                    std::cerr << "Warning: SPI transfer failed" << std::endl;
+                    if (transfer_error_.fail()) {
+                        PB_ERROR("SPI: transfer failed (%u times)", transfer_error_.failures());
+                    }
+                }
+                else if (transfer_error_.succeed()) {
+                    PB_INFO("SPI: transfers work again");
                 }
             }
     };

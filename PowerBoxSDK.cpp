@@ -22,7 +22,7 @@
  * SOFTWARE.
  * **************************************************************************** */
 
-#define SDK_VERSION "1.5.0"
+#define SDK_VERSION "1.6.0"
 
 #include "PowerBoxSDK.h"
 #include "PowerBoxLogging.h"
