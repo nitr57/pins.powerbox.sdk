@@ -1252,7 +1252,8 @@ PBAPI PB_ERROR_TYPE PBBeep(int id, int volume, int duration_ms)
     auto it = g_devices.find(id);
     if (it == g_devices.end())
     {
-        PB_ERROR("PBBeep: Device id=%d not found", id);
+        // Info like a failed beep (see below)
+        PB_INFO("PBBeep: Device id=%d not found", id);
         return PB_ERROR_INVALID_ID;
     }
 
@@ -1271,7 +1272,9 @@ PBAPI PB_ERROR_TYPE PBBeep(int id, int volume, int duration_ms)
     }
     else
     {
-        PB_ERROR("PBBeep: Failed to beep device, error=%d", result);
+        // Info, not error: error lines can trigger an alarm beep, and a beep
+        // that fails must not trigger the next one. The caller gets the result.
+        PB_INFO("PBBeep: Failed to beep device id=%d, error=%d", id, result);
     }
     return result;
 }
